@@ -1,0 +1,10 @@
+config.json
+state.json
+users.json
+data/
+config/
+state/
+__pycache__/
+*.pyc
+.env
+venv/

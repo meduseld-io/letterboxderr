@@ -1,0 +1,11 @@
+{
+  "seerr_url": "http://localhost:5055",
+  "seerr_api_key": "your-seerr-api-key-here",
+  "sync_interval": 3600,
+  "users": [
+    {
+      "letterboxd": "your-letterboxd-username",
+      "seerr_user_id": 1
+    }
+  ]
+}

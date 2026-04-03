@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Letterboxderr</title>
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #14181c;
+            color: #d8d8d8;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .container {
+            max-width: 600px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+            flex: 1;
+        }
+
+        /* Header */
+        .header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .header img {
+            width: 80px;
+            margin-bottom: 0.5rem;
+        }
+
+        .header h1 {
+            font-size: 1.8rem;
+            color: #ff8000;
+            margin-bottom: 0.3rem;
+        }
+
+        .header p {
+            color: #9ab;
+            font-size: 0.9rem;
+        }
+
+        /* Cards */
+        .card {
+            background: #1c2228;
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            border: 1px solid #2c3440;
+        }
+
+        .card h2 {
+            font-size: 1rem;
+            color: #9ab;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 1rem;
+        }
+
+        /* Login form */
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 0.85rem;
+            color: #9ab;
+            margin-bottom: 0.3rem;
+        }
+
+        .form-group input {
+            width: 100%;
+            padding: 0.7rem;
+            background: #14181c;
+            border: 1px solid #2c3440;
+            border-radius: 8px;
+            color: #d8d8d8;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus {
+            border-color: #ff8000;
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 0.7rem 1.5rem;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: opacity 0.2s;
+            font-weight: 500;
+        }
+
+        .btn:hover { opacity: 0.85; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        .btn-primary {
+            background: #ff8000;
+            color: #14181c;
+        }
+
+        .btn-danger {
+            background: #e03030;
+            color: #fff;
+        }
+
+        .btn-outline {
+            background: transparent;
+            border: 1px solid #2c3440;
+            color: #9ab;
+        }
+
+        .btn-block {
+            display: block;
+            width: 100%;
+        }
+
+        /* User info */
+        .user-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 1.5rem;
+            padding: 0.8rem 1rem;
+            background: #1c2228;
+            border-radius: 10px;
+            border: 1px solid #2c3440;
+        }
+
+        .user-bar .user-info {
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+        }
+
+        .user-bar .avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: #2c3440;
+            object-fit: cover;
+        }
+
+        .user-bar .avatar-fallback {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: #ff8000;
+            color: #14181c;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 0.9rem;
+        }
+
+        .user-bar .name {
+            font-weight: 500;
+        }
+
+        .user-bar .logout {
+            font-size: 0.8rem;
+            color: #9ab;
+            cursor: pointer;
+            background: none;
+            border: none;
+            text-decoration: underline;
+        }
+
+        /* Linked status */
+        .linked-status {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem;
+            background: #0d1117;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+
+        .linked-status .lb-user {
+            color: #ff8000;
+            font-weight: 600;
+        }
+
+        /* Sync status */
+        .sync-info {
+            font-size: 0.85rem;
+            color: #9ab;
+            margin-top: 0.8rem;
+        }
+
+        .sync-info .badge {
+            display: inline-block;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+
+        .badge-syncing { background: #e6a817; color: #14181c; }
+        .badge-complete { background: #ff8000; color: #14181c; }
+        .badge-error { background: #e03030; color: #fff; }
+
+        /* Preview list */
+        .preview-list {
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 0.8rem;
+        }
+
+        .preview-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid #2c3440;
+            font-size: 0.9rem;
+        }
+
+        .preview-item:last-child { border-bottom: none; }
+        .preview-item .year { color: #9ab; }
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            bottom: 1.5rem;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 0.7rem 1.2rem;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            z-index: 100;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+        }
+
+        .toast.show { opacity: 1; }
+        .toast-success { background: #ff8000; color: #14181c; }
+        .toast-error { background: #e03030; color: #fff; }
+
+        .actions { display: flex; gap: 0.5rem; margin-top: 1rem; }
+        .actions .btn { flex: 1; }
+
+        .hidden { display: none; }
+
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid transparent;
+            border-top-color: currentColor;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            vertical-align: middle;
+            margin-right: 0.3rem;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .footer {
+            text-align: center;
+            padding: 1rem;
+            font-size: 0.8rem;
+            color: #556;
+        }
+
+        .footer a { color: #9ab; text-decoration: none; }
+        .footer a:hover { color: #ff8000; }
+
+        /* Failures modal */
+        .failures-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 200;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .failures-modal {
+            background: #1c2228;
+            border: 1px solid #2c3440;
+            border-radius: 12px;
+            padding: 1.5rem;
+            max-width: 500px;
+            width: 90%;
+            max-height: 60vh;
+            overflow-y: auto;
+        }
+
+        .failures-modal h3 {
+            color: #e03030;
+            font-size: 1rem;
+            margin-bottom: 1rem;
+        }
+
+        .failure-item {
+            padding: 0.5rem 0;
+            border-bottom: 1px solid #2c3440;
+            font-size: 0.85rem;
+        }
+
+        .failure-item:last-child { border-bottom: none; }
+        .failure-item .title { color: #d8d8d8; }
+        .failure-item .reason { color: #9ab; font-size: 0.8rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <a href="https://github.com/meduseld-io/letterboxderr" target="_blank"><img src="/static/logo.png" alt="Letterboxderr"></a>
+            <h1>Letterboxderr</h1>
+            <p>Sync your Letterboxd watchlist to Seerr</p>
+        </div>
+
+        <!-- Login view -->
+        <div id="login-view">
+            <div class="card">
+                <h2>Sign in with Seerr</h2>
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" placeholder="Your Seerr username" autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" placeholder="Your Seerr password" autocomplete="current-password">
+                </div>
+                <button class="btn btn-primary btn-block" id="login-btn" onclick="login()">Sign In</button>
+                <p id="login-error" class="hidden" style="color: #e03030; font-size: 0.85rem; margin-top: 0.8rem;"></p>
+            </div>
+        </div>
+
+        <!-- Main view (authenticated) -->
+        <div id="main-view" class="hidden">
+            <div class="user-bar">
+                <div class="user-info">
+                    <span id="user-avatar-container"><div class="avatar-fallback">?</div></span>
+                    <span class="name" id="user-name"></span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 0.6rem;">
+                    <a id="seerr-link" href="#" target="_blank" class="btn btn-outline" style="padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none;">Open Seerr</a>
+                    <button class="logout" onclick="logout()">Sign out</button>
+                </div>
+            </div>
+
+            <!-- Link card -->
+            <div class="card" id="link-card">
+                <h2>Letterboxd Account</h2>
+
+                <!-- Not linked -->
+                <div id="not-linked">
+                    <p style="color: #9ab; font-size: 0.9rem; margin-bottom: 1rem;">
+                        Enter your Letterboxd username to sync your watchlist.
+                    </p>
+                    <div class="form-group">
+                        <input type="text" id="lb-username" placeholder="letterboxd username">
+                    </div>
+                    <div class="actions">
+                        <button class="btn btn-outline" onclick="previewWatchlist()">Preview</button>
+                        <button class="btn btn-primary" onclick="linkAccount()">Link Account</button>
+                    </div>
+                </div>
+
+                <!-- Linked -->
+                <div id="linked" class="hidden">
+                    <div class="linked-status">
+                        <div>
+                            <span style="color: #9ab;">Linked to </span>
+                            <span class="lb-user" id="linked-username"></span>
+                        </div>
+                        <button class="btn btn-outline" style="padding: 0.4rem 0.8rem; font-size: 0.8rem;" onclick="unlinkAccount()">Unlink</button>
+                    </div>
+                    <div class="actions">
+                        <button class="btn btn-primary btn-block" id="sync-btn" onclick="triggerSync()">
+                            Sync Now
+                        </button>
+                    </div>
+                    <div class="sync-info" id="sync-info"></div>
+                </div>
+            </div>
+
+            <!-- Preview card -->
+            <div class="card hidden" id="preview-card">
+                <h2>Watchlist Preview <span id="preview-count" style="color: #ff8000;"></span></h2>
+                <div class="preview-list" id="preview-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        &copy; <span id="copyright-year"></span> <a href="https://github.com/meduseld-io" target="_blank">meduseld.io</a>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+    document.getElementById('copyright-year').textContent = new Date().getFullYear();
+
+    let currentUser = null;
+    let pollInterval = null;
+
+    // ------ Init ------
+    async function init() {
+        try {
+            const resp = await fetch('/api/me');
+            if (resp.ok) {
+                const data = await resp.json();
+                if (data.authenticated) {
+                    currentUser = data;
+                    showMainView();
+                    return;
+                }
+            }
+        } catch (e) {
+            console.error('Auth check failed:', e);
+        }
+        showLoginView();
+    }
+
+    // ------ Views ------
+    function showLoginView() {
+        document.getElementById('login-view').classList.remove('hidden');
+        document.getElementById('main-view').classList.add('hidden');
+    }
+
+    function showMainView() {
+        document.getElementById('login-view').classList.add('hidden');
+        document.getElementById('main-view').classList.remove('hidden');
+
+        // Set user info
+        document.getElementById('user-name').textContent = currentUser.displayName;
+        const avatarContainer = document.getElementById('user-avatar-container');
+        if (currentUser.avatar) {
+            avatarContainer.innerHTML = `<img class="avatar" src="${currentUser.avatar}" alt="" onerror="this.parentElement.innerHTML='<div class=\\'avatar-fallback\\'>${(currentUser.displayName || '?')[0].toUpperCase()}</div>'">`;
+        } else {
+            avatarContainer.innerHTML = `<div class="avatar-fallback">${(currentUser.displayName || '?')[0].toUpperCase()}</div>`;
+        }
+
+        // Show Seerr link
+        if (currentUser.seerr_url) {
+            const seerrLink = document.getElementById('seerr-link');
+            seerrLink.href = currentUser.seerr_url;
+            seerrLink.style.display = '';
+        }
+
+        // Show linked or not-linked state
+        if (currentUser.letterboxd) {
+            document.getElementById('not-linked').classList.add('hidden');
+            document.getElementById('linked').classList.remove('hidden');
+            document.getElementById('linked-username').innerHTML = `<a href="https://letterboxd.com/${currentUser.letterboxd}/" target="_blank" style="color: #ff8000; text-decoration: none;">${currentUser.letterboxd}</a>`;
+            updateSyncInfo(currentUser.sync_status);
+            // If status shows syncing, disable button and start polling
+            if (currentUser.sync_status && currentUser.sync_status.status === 'syncing') {
+                document.getElementById('sync-btn').disabled = true;
+                document.getElementById('sync-btn').innerHTML = '<span class="spinner"></span> Syncing...';
+                startPollingStatus();
+            }
+        } else {
+            document.getElementById('not-linked').classList.remove('hidden');
+            document.getElementById('linked').classList.add('hidden');
+        }
+    }
+
+    // ------ Auth ------
+    async function login() {
+        const username = document.getElementById('username').value.trim();
+        const password = document.getElementById('password').value;
+        const errorEl = document.getElementById('login-error');
+        const btn = document.getElementById('login-btn');
+
+        if (!username || !password) {
+            errorEl.textContent = 'Please enter both fields';
+            errorEl.classList.remove('hidden');
+            return;
+        }
+
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Signing in...';
+        errorEl.classList.add('hidden');
+
+        try {
+            const resp = await fetch('/api/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password }),
+            });
+
+            if (resp.ok) {
+                await init();
+            } else {
+                const data = await resp.json();
+                errorEl.textContent = data.error || 'Login failed';
+                errorEl.classList.remove('hidden');
+            }
+        } catch (e) {
+            console.error('Login failed:', e);
+            errorEl.textContent = 'Could not reach server';
+            errorEl.classList.remove('hidden');
+        }
+
+        btn.disabled = false;
+        btn.textContent = 'Sign In';
+    }
+
+    async function logout() {
+        try {
+            await fetch('/api/logout', { method: 'POST' });
+        } catch (e) {
+            console.error('Logout failed:', e);
+        }
+        currentUser = null;
+        if (pollInterval) clearInterval(pollInterval);
+        showLoginView();
+    }
+
+    // ------ Link/Unlink ------
+    async function linkAccount() {
+        const username = document.getElementById('lb-username').value.trim();
+        if (!username) {
+            showToast('Enter a Letterboxd username', 'error');
+            return;
+        }
+
+        try {
+            const resp = await fetch('/api/link', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ letterboxd: username }),
+            });
+            const data = await resp.json();
+
+            if (resp.ok) {
+                currentUser.letterboxd = data.letterboxd;
+                showMainView();
+                showToast('Letterboxd account linked');
+            } else {
+                showToast(data.error || 'Link failed', 'error');
+            }
+        } catch (e) {
+            console.error('Link failed:', e);
+            showToast('Could not reach server', 'error');
+        }
+    }
+
+    async function unlinkAccount() {
+        try {
+            await fetch('/api/unlink', { method: 'POST' });
+            currentUser.letterboxd = '';
+            document.getElementById('preview-card').classList.add('hidden');
+            showMainView();
+            showToast('Account unlinked');
+        } catch (e) {
+            console.error('Unlink failed:', e);
+            showToast('Unlink failed', 'error');
+        }
+    }
+
+    // ------ Sync ------
+    async function triggerSync() {
+        const btn = document.getElementById('sync-btn');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Syncing...';
+
+        try {
+            const resp = await fetch('/api/sync', { method: 'POST' });
+            if (resp.ok) {
+                showToast('Sync started');
+                startPollingStatus();
+            } else {
+                const data = await resp.json();
+                showToast(data.error || 'Sync failed', 'error');
+                btn.disabled = false;
+                btn.textContent = 'Sync Now';
+            }
+        } catch (e) {
+            console.error('Sync trigger failed:', e);
+            showToast('Could not reach server', 'error');
+            btn.disabled = false;
+            btn.textContent = 'Sync Now';
+        }
+    }
+
+    function startPollingStatus() {
+        if (pollInterval) clearInterval(pollInterval);
+        pollInterval = setInterval(async () => {
+            try {
+                const resp = await fetch('/api/status');
+                if (resp.ok) {
+                    const status = await resp.json();
+                    updateSyncInfo(status);
+                    if (status.status !== 'syncing') {
+                        clearInterval(pollInterval);
+                        pollInterval = null;
+                        document.getElementById('sync-btn').disabled = false;
+                        document.getElementById('sync-btn').textContent = 'Sync Now';
+                        if (status.status === 'complete') {
+                            if (status.failures) lastFailures = status.failures;
+                            showToast(`Synced: ${status.added} added, ${status.skipped} already synced`);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('Status poll failed:', e);
+            }
+        }, 2000);
+    }
+
+    function updateSyncInfo(status) {
+        const el = document.getElementById('sync-info');
+        if (!status || !status.status) {
+            el.innerHTML = '<span style="color: #556;">No sync yet - press Sync Now to start</span>';
+            return;
+        }
+
+        if (status.failures) lastFailures = status.failures;
+
+        let badge = '';
+        if (status.status === 'syncing') badge = '';
+        else if (status.status === 'complete') badge = '<span class="badge badge-complete">Complete</span>';
+        else if (status.status === 'error') badge = '<span class="badge badge-error">Error</span>';
+
+        let details = '';
+        if (status.added !== undefined) {
+            let failedText = `${status.failed} failed`;
+            if (status.failed > 0 && status.failures && status.failures.length > 0) {
+                failedText = `<a href="#" style="color: #e03030; text-decoration: underline;" onclick="showFailures(event)">${status.failed} failed</a>`;
+            }
+            details = ` - ${status.added} added, ${status.skipped} already synced, ${failedText}`;
+        }
+        if (status.last_sync) {
+            const syncDate = new Date(status.last_sync);
+            const ago = timeAgo(syncDate);
+            details += ` (${ago})`;
+        }
+
+        el.innerHTML = badge + details;
+    }
+
+    // ------ Preview ------
+    async function previewWatchlist() {
+        const username = document.getElementById('lb-username').value.trim();
+        if (!username) {
+            showToast('Enter a username first', 'error');
+            return;
+        }
+
+        const card = document.getElementById('preview-card');
+        const list = document.getElementById('preview-list');
+        const count = document.getElementById('preview-count');
+
+        list.innerHTML = '<div style="color: #9ab; padding: 1rem;"><span class="spinner"></span> Scraping watchlist - this may take a minute...</div>';
+        card.classList.remove('hidden');
+
+        try {
+            const resp = await fetch(`/api/preview?username=${encodeURIComponent(username)}`);
+            const data = await resp.json();
+
+            if (data.movies && data.movies.length > 0) {
+                count.textContent = `(${data.count})`;
+                count.title = 'Number of movies on the watchlist';
+                list.innerHTML = data.movies.map(m =>
+                    `<div class="preview-item">
+                        <span>${m.title}</span>
+                        <span class="year">${m.year || ''}</span>
+                    </div>`
+                ).join('');
+            } else {
+                count.textContent = '(0)';
+                list.innerHTML = '<div style="color: #9ab; padding: 1rem;">No movies found. Check the username is correct and the watchlist is public. <button class="btn btn-outline" style="margin-top: 0.5rem; padding: 0.3rem 0.8rem; font-size: 0.8rem;" onclick="previewWatchlist()">Retry</button></div>';
+            }
+        } catch (e) {
+            console.error('Preview failed:', e);
+            list.innerHTML = '<div style="color: #e03030; padding: 1rem;">Failed to load watchlist <button class="btn btn-outline" style="margin-left: 0.5rem; padding: 0.3rem 0.8rem; font-size: 0.8rem;" onclick="previewWatchlist()">Retry</button></div>';
+        }
+    }
+
+    // ------ Failures ------
+    let lastFailures = [];
+
+    function showFailures(e) {
+        e.preventDefault();
+        if (!lastFailures.length) return;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'failures-overlay';
+        overlay.onclick = (ev) => { if (ev.target === overlay) overlay.remove(); };
+
+        const modal = document.createElement('div');
+        modal.className = 'failures-modal';
+        modal.innerHTML = `<h3>Failed items (${lastFailures.length})</h3>` +
+            lastFailures.map(f =>
+                `<div class="failure-item">
+                    <div class="title">${f.title}</div>
+                    <div class="reason">${f.reason}</div>
+                </div>`
+            ).join('') +
+            `<button class="btn btn-outline btn-block" style="margin-top: 1rem;" onclick="this.closest('.failures-overlay').remove()">Close</button>`;
+
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+    }
+
+    // ------ Helpers ------
+    function showToast(msg, type = 'success') {
+        const el = document.getElementById('toast');
+        el.textContent = msg;
+        el.className = `toast toast-${type} show`;
+        setTimeout(() => el.classList.remove('show'), 3000);
+    }
+
+    function timeAgo(date) {
+        const seconds = Math.floor((new Date() - date) / 1000);
+        if (seconds < 60) return 'just now';
+        if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+        if (seconds < 86400) return Math.floor(seconds / 3600) + 'h ago';
+        return Math.floor(seconds / 86400) + 'd ago';
+    }
+
+    // Enter key support on login form
+    document.getElementById('password').addEventListener('keydown', e => {
+        if (e.key === 'Enter') login();
+    });
+    document.getElementById('username').addEventListener('keydown', e => {
+        if (e.key === 'Enter') document.getElementById('password').focus();
+    });
+    document.getElementById('lb-username').addEventListener('keydown', e => {
+        if (e.key === 'Enter') linkAccount();
+    });
+
+    // Boot
+    init();
+    </script>
+</body>
+</html>

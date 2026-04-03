@@ -1,0 +1,16 @@
+services:
+  letterboxderr:
+    image: ghcr.io/meduseld-io/letterboxderr:latest
+    container_name: letterboxderr
+    restart: unless-stopped
+    ports:
+      - "8484:8484"
+    volumes:
+      - letterboxderr-data:/data
+    environment:
+      - SEERR_URL=http://localhost:5055  # Change to your Seerr URL
+      - SEERR_API_KEY=                   # Your Seerr API key (Settings > General)
+      - SYNC_INTERVAL=3600               # Seconds between auto-syncs (0 to disable)
+
+volumes:
+  letterboxderr-data:
