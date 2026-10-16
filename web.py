@@ -7,31 +7,31 @@ Users authenticate with their Seerr credentials, link their Letterboxd
 username, and trigger syncs from the browser.
 """
 
-import os
 import json
+import logging
+import os
 import threading
 import time
-import logging
+from collections import OrderedDict
+from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
-from datetime import datetime, timezone
-
-from flask import Flask, request, jsonify, send_from_directory, make_response
 
 import requests as http_requests
-
-try:
-    import cloudscraper
-    _scraper = cloudscraper.create_scraper()
-except ImportError:
-    _scraper = None
+from flask import Flask, g, jsonify, make_response, request, send_from_directory
 
 from letterboxderr import (
-    fetch_letterboxd_watchlist,
-    resolve_tmdb_id_via_seerr,
-    add_to_seerr_watchlist,
-    get_seerr_watchlist,
-    load_state,
-    save_state,
+    DRY_RUN,
+    WatchlistFetchError,
+    env_int,
+    fetch_watchlist_slugs,
+    forget_user,
+    is_valid_username,
+    make_client,
+    read_state,
+    slug_to_title,
+    sync_watchlist,
+    write_json_atomic,
 )
 
 logger = logging.getLogger("letterboxderr.web")
@@ -42,18 +42,27 @@ logger = logging.getLogger("letterboxderr.web")
 SEERR_URL = os.environ.get("SEERR_URL", "http://localhost:5055").rstrip("/")
 SEERR_API_KEY = os.environ.get("SEERR_API_KEY", "")
 SEERR_PUBLIC_URL = os.environ.get("SEERR_PUBLIC_URL", "").rstrip("/")
-WEB_PORT = int(os.environ.get("WEB_PORT", "8484"))
+WEB_PORT = env_int("WEB_PORT", 8484, minimum=1)
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 USERS_FILE = os.environ.get("USERS_FILE", "users.json")
-STATE_FILE = os.environ.get("STATE_FILE", "state.json")
-SYNC_INTERVAL = int(os.environ.get("SYNC_INTERVAL", "3600"))
+SYNC_INTERVAL = env_int("SYNC_INTERVAL", 3600)
+FIRST_SYNC_DELAY = env_int("FIRST_SYNC_DELAY", 60)
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
+
+
+class SeerrUnavailable(Exception):
+    """Seerr couldn't be reached, as opposed to rejecting the user."""
 
 
 # ---------------------------------------------------------------------------
-# User storage - persists linked Letterboxd usernames per Seerr user
+# User storage - persists linked Letterboxd usernames and last sync result
+# per Seerr user: {seerr_user_id: {letterboxd, seerr_display_name, linked_at, last_result}}
 # ---------------------------------------------------------------------------
+_users_lock = threading.Lock()
+
+
 def load_users():
-    """Load user mappings from disk. Returns {seerr_user_id: {letterboxd, ...}}."""
+    """Load user mappings from disk."""
     path = Path(USERS_FILE)
     if path.exists():
         try:
@@ -63,21 +72,26 @@ def load_users():
     return {}
 
 
-def save_users(users):
-    """Persist user mappings to disk."""
-    try:
-        Path(USERS_FILE).write_text(json.dumps(users, indent=2))
-    except Exception as e:
-        logger.error("Failed to save users file: %s", e)
+def update_users(fn):
+    """Read-modify-write the users file under a lock."""
+    with _users_lock:
+        users = load_users()
+        fn(users)
+        try:
+            write_json_atomic(USERS_FILE, users)
+        except Exception as e:
+            logger.error("Failed to save users file: %s", e)
+        return users
 
 
 # ---------------------------------------------------------------------------
-# Seerr auth helper
+# Seerr auth helpers
 # ---------------------------------------------------------------------------
 def authenticate_seerr_user(cookie_value):
     """
     Validate a Seerr session cookie by calling /api/v1/auth/me.
-    Returns the Seerr user dict or None.
+    Returns the Seerr user dict, or None if the session isn't valid.
+    Raises SeerrUnavailable if Seerr can't be reached.
     """
     try:
         resp = http_requests.get(
@@ -85,150 +99,134 @@ def authenticate_seerr_user(cookie_value):
             headers={"Cookie": f"connect.sid={cookie_value}"},
             timeout=10,
         )
-        if resp.ok:
-            return resp.json()
-    except Exception as e:
+    except http_requests.RequestException as e:
         logger.error("Seerr auth check failed: %s", e)
+        raise SeerrUnavailable() from e
+    if resp.status_code >= 500:
+        raise SeerrUnavailable()
+    if resp.ok:
+        return resp.json()
     return None
 
 
-def get_seerr_user_from_request():
-    """Extract and validate Seerr user from the request cookie."""
-    cookie = request.cookies.get("connect.sid")
-    if not cookie:
-        return None
-    return authenticate_seerr_user(cookie)
+def require_user(view):
+    """Resolve the Seerr user from the session cookie into g.user, or return 401/503."""
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        cookie = request.cookies.get("connect.sid")
+        if not cookie:
+            return jsonify({"authenticated": False, "error": "Not authenticated"}), 401
+        try:
+            user = authenticate_seerr_user(cookie)
+        except SeerrUnavailable:
+            return jsonify({"error": "Seerr is unreachable"}), 503
+        if not user:
+            return jsonify({"authenticated": False, "error": "Not authenticated"}), 401
+        g.user = user
+        g.seerr_user_id = str(user.get("id", ""))
+        return view(*args, **kwargs)
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
-# Background sync thread
+# Sync
 # ---------------------------------------------------------------------------
-sync_status = {}  # {seerr_user_id: {status, last_sync, added, skipped, failed}}
+sync_status = {}  # {seerr_user_id: {status, last_sync, added, skipped, failed, ...}}
 sync_lock = threading.Lock()
 
-# Watchlist cache - stores scraped results so sync can reuse preview data
-# {username: {"movies": [...], "fetched_at": timestamp}}
-_watchlist_cache = {}
-_CACHE_TTL = 300  # 5 minutes
+
+def _now():
+    return datetime.now(UTC).isoformat()
 
 
-def _get_watchlist_cached(username):
-    """Fetch watchlist with caching. Returns movie list."""
-    now = time.time()
-    cached = _watchlist_cache.get(username)
-    if cached and (now - cached["fetched_at"]) < _CACHE_TTL:
-        logger.info("Using cached watchlist for '%s' (%d movies)", username, len(cached["movies"]))
-        return cached["movies"]
+def get_status(seerr_user_id):
+    """Live status if a sync ran since startup, else the last persisted result."""
+    with sync_lock:
+        status = sync_status.get(seerr_user_id)
+    if status:
+        return status
+    return load_users().get(seerr_user_id, {}).get("last_result", {})
 
-    movies = fetch_letterboxd_watchlist(username)
-    _watchlist_cache[username] = {"movies": movies, "fetched_at": now}
-    return movies
+
+def _claim_sync(seerr_user_id):
+    """Mark a user as syncing. Returns False if a sync is already running."""
+    with sync_lock:
+        if sync_status.get(seerr_user_id, {}).get("status") == "syncing":
+            return False
+        sync_status[seerr_user_id] = {"status": "syncing"}
+        return True
+
+
+def _run_user_sync(seerr_user_id, lb_username):
+    """Sync one user (already claimed) and record the result."""
+    try:
+        result = sync_watchlist(lb_username, int(seerr_user_id), SEERR_URL, SEERR_API_KEY)
+        status = {"status": "complete", "last_sync": _now(), **result}
+    except WatchlistFetchError as e:
+        logger.error("Sync failed for %s: %s", lb_username, e)
+        status = {"status": "error", "error": str(e), "last_sync": _now()}
+    except Exception as e:
+        logger.exception("Sync failed for %s", lb_username)
+        status = {"status": "error", "error": f"Unexpected error: {e}", "last_sync": _now()}
+
+    with sync_lock:
+        sync_status[seerr_user_id] = status
+
+    def persist(users):
+        # Only record it if the user is still linked to the same username
+        if users.get(seerr_user_id, {}).get("letterboxd") == lb_username:
+            users[seerr_user_id]["last_result"] = status
+    update_users(persist)
 
 
 def background_sync_all():
-    """Run sync for all registered users."""
-    users = load_users()
-    if not users:
-        return
-
-    state = load_state()
-
-    for seerr_user_id, user_data in users.items():
+    """Run sync for all registered users, skipping any already syncing."""
+    for seerr_user_id, user_data in load_users().items():
         lb_username = user_data.get("letterboxd")
         if not lb_username:
             continue
-
-        with sync_lock:
-            sync_status[seerr_user_id] = {"status": "syncing", "last_sync": None}
-
-        try:
-            result = _sync_single_user(lb_username, int(seerr_user_id), state)
-            with sync_lock:
-                sync_status[seerr_user_id] = {
-                    "status": "complete",
-                    "last_sync": datetime.now(timezone.utc).isoformat(),
-                    **result,
-                }
-        except Exception as e:
-            logger.error("Background sync failed for %s: %s", lb_username, e)
-            with sync_lock:
-                sync_status[seerr_user_id] = {
-                    "status": "error",
-                    "error": str(e),
-                    "last_sync": datetime.now(timezone.utc).isoformat(),
-                }
-
-    save_state(state)
-
-
-def _sync_single_user(lb_username, seerr_user_id, state):
-    """Sync one user, returns {added, skipped, failed, total, failures}."""
-    movies = _get_watchlist_cached(lb_username)
-    if not movies:
-        return {"added": 0, "skipped": 0, "failed": 0, "total": 0, "failures": []}
-
-    synced_key = f"{lb_username}:{seerr_user_id}"
-    synced_ids = set(state.get(synced_key, []))
-    existing_ids = get_seerr_watchlist(SEERR_URL, SEERR_API_KEY, seerr_user_id)
-    synced_ids.update(existing_ids)
-
-    added = 0
-    skipped = 0
-    failed = 0
-    failures = []
-
-    for movie in movies:
-        tmdb_id = movie.get("tmdb_id")
-
-        # Fall back to Seerr search if scraping didn't find it
-        if not tmdb_id and movie.get("title"):
-            tmdb_id = resolve_tmdb_id_via_seerr(
-                movie["title"], movie.get("year"), SEERR_URL, SEERR_API_KEY,
-            )
-
-        if not tmdb_id:
-            failed += 1
-            failures.append({
-                "title": movie.get("title") or movie.get("letterboxd_url", "Unknown"),
-                "reason": "Could not find TMDb ID",
-            })
+        if not _claim_sync(seerr_user_id):
+            logger.info("Skipping %s, a sync is already running", lb_username)
             continue
-
-        if tmdb_id in synced_ids:
-            skipped += 1
-            continue
-
-        title = movie.get("title") or f"TMDb:{tmdb_id}"
-        media_type = movie.get("media_type", "movie")
-        success = add_to_seerr_watchlist(
-            tmdb_id, title, SEERR_URL, SEERR_API_KEY, seerr_user_id, media_type,
-        )
-        if success:
-            synced_ids.add(tmdb_id)
-            added += 1
-        else:
-            failed += 1
-            failures.append({
-                "title": title,
-                "reason": "Seerr API rejected the request",
-            })
-
-        time.sleep(0.3)
-
-    state[synced_key] = list(synced_ids)
-    return {"added": added, "skipped": skipped, "failed": failed, "total": len(movies), "failures": failures}
+        _run_user_sync(seerr_user_id, lb_username)
 
 
 def sync_loop():
     """Background thread that syncs all users on an interval."""
-    # Wait for the first interval before syncing (don't sync on startup)
-    time.sleep(SYNC_INTERVAL)
+    time.sleep(FIRST_SYNC_DELAY)
     while True:
         try:
             background_sync_all()
-        except Exception as e:
-            logger.error("Sync loop error: %s", e)
+        except Exception:
+            logger.exception("Sync loop error")
         time.sleep(SYNC_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Preview cache - watchlist slugs only, bounded, short-lived
+# ---------------------------------------------------------------------------
+_PREVIEW_TTL = 300  # 5 minutes
+_PREVIEW_MAX = 50
+_preview_cache = OrderedDict()  # {username: (fetched_at, slugs)}
+_preview_lock = threading.Lock()
+
+
+def _get_slugs_cached(username):
+    now = time.time()
+    with _preview_lock:
+        cached = _preview_cache.get(username)
+        if cached and now - cached[0] < _PREVIEW_TTL:
+            _preview_cache.move_to_end(username)
+            return cached[1]
+
+    slugs = fetch_watchlist_slugs(username, make_client())
+
+    with _preview_lock:
+        _preview_cache[username] = (now, slugs)
+        _preview_cache.move_to_end(username)
+        while len(_preview_cache) > _PREVIEW_MAX:
+            _preview_cache.popitem(last=False)
+    return slugs
 
 
 # ---------------------------------------------------------------------------
@@ -246,206 +244,198 @@ def index():
 @app.route("/api/health")
 def api_health():
     """Health check endpoint."""
-    users = load_users()
-    return jsonify({"status": "ok", "users": len(users)})
+    return jsonify({"status": "ok", "users": len(load_users())})
 
 
 @app.route("/api/me")
+@require_user
 def api_me():
     """Get current user info from Seerr session."""
-    user = get_seerr_user_from_request()
-    if not user:
-        return jsonify({"authenticated": False}), 401
-
-    seerr_user_id = str(user.get("id", ""))
-    users = load_users()
-    user_data = users.get(seerr_user_id, {})
+    user = g.user
+    user_data = load_users().get(g.seerr_user_id, {})
 
     return jsonify({
         "authenticated": True,
         "id": user.get("id"),
-        "displayName": user.get("displayName", user.get("username", "")),
+        "displayName": user.get("displayName") or user.get("username") or user.get("email", ""),
         "avatar": user.get("avatar"),
         "letterboxd": user_data.get("letterboxd", ""),
-        "sync_status": sync_status.get(seerr_user_id, {}),
+        "sync_status": get_status(g.seerr_user_id) if user_data else {},
         "seerr_url": SEERR_PUBLIC_URL or SEERR_URL,
+        "dry_run": DRY_RUN,
     })
 
 
 @app.route("/api/link", methods=["POST"])
+@require_user
 def api_link():
     """Link or update a Letterboxd username for the current user."""
-    user = get_seerr_user_from_request()
-    if not user:
-        return jsonify({"error": "Not authenticated"}), 401
-
-    data = request.get_json()
+    data = request.get_json(silent=True)
     if not data or not data.get("letterboxd"):
         return jsonify({"error": "letterboxd username required"}), 400
 
-    lb_username = data["letterboxd"].strip().lower()
+    lb_username = str(data["letterboxd"]).strip().lower()
+    if not is_valid_username(lb_username):
+        return jsonify({"error": "Letterboxd usernames only contain letters, numbers and underscores"}), 400
 
     # Validate the Letterboxd username exists by checking the watchlist page
     try:
-        client = _scraper if _scraper else http_requests
-        resp = client.get(
-            f"https://letterboxd.com/{lb_username}/watchlist/",
-            timeout=10,
-        )
-        if resp.status_code == 404:
-            return jsonify({"error": "Letterboxd user not found"}), 404
+        resp = make_client().get(f"https://letterboxd.com/{lb_username}/watchlist/", timeout=10)
     except Exception as e:
         logger.error("Failed to validate Letterboxd user '%s': %s", lb_username, e)
-        return jsonify({"error": "Could not validate Letterboxd username"}), 502
+        return jsonify({"error": "Could not reach Letterboxd to check the username"}), 502
+    if resp.status_code == 404:
+        return jsonify({"error": "Letterboxd user not found"}), 404
+    if not resp.ok:
+        return jsonify({"error": f"Letterboxd returned {resp.status_code}, try again later"}), 502
 
-    seerr_user_id = str(user["id"])
-    users = load_users()
-    users[seerr_user_id] = {
-        "letterboxd": lb_username,
-        "seerr_display_name": user.get("displayName", user.get("username", "")),
-        "linked_at": datetime.now(timezone.utc).isoformat(),
-    }
-    save_users(users)
+    seerr_user_id = g.seerr_user_id
+    previous = {}
 
-    logger.info(
-        "User %s (Seerr #%s) linked Letterboxd: %s",
-        user.get("displayName", "?"), seerr_user_id, lb_username,
-    )
+    def link(users):
+        previous.update(users.get(seerr_user_id, {}))
+        users[seerr_user_id] = {
+            "letterboxd": lb_username,
+            "seerr_display_name": g.user.get("displayName") or g.user.get("username", ""),
+            "linked_at": _now(),
+        }
+    update_users(link)
 
+    old_username = previous.get("letterboxd")
+    if old_username and old_username != lb_username:
+        forget_user(old_username, int(seerr_user_id))
+        with sync_lock:
+            if sync_status.get(seerr_user_id, {}).get("status") != "syncing":
+                sync_status.pop(seerr_user_id, None)
+
+    logger.info("User %s (Seerr #%s) linked Letterboxd: %s", g.user.get("displayName", "?"), seerr_user_id, lb_username)
     return jsonify({"ok": True, "letterboxd": lb_username})
 
 
 @app.route("/api/unlink", methods=["POST"])
+@require_user
 def api_unlink():
     """Remove the Letterboxd link for the current user."""
-    user = get_seerr_user_from_request()
-    if not user:
-        return jsonify({"error": "Not authenticated"}), 401
+    seerr_user_id = g.seerr_user_id
+    removed = {}
 
-    seerr_user_id = str(user["id"])
-    users = load_users()
-    if seerr_user_id in users:
-        del users[seerr_user_id]
-        save_users(users)
-        logger.info("User %s unlinked Letterboxd", user.get("displayName", "?"))
+    def unlink(users):
+        removed.update(users.pop(seerr_user_id, {}))
+    update_users(unlink)
+
+    if removed.get("letterboxd"):
+        forget_user(removed["letterboxd"], int(seerr_user_id))
+        logger.info("User %s unlinked Letterboxd", g.user.get("displayName", "?"))
+    with sync_lock:
+        if sync_status.get(seerr_user_id, {}).get("status") != "syncing":
+            sync_status.pop(seerr_user_id, None)
 
     return jsonify({"ok": True})
 
 
 @app.route("/api/sync", methods=["POST"])
+@require_user
 def api_sync():
     """Trigger an immediate sync for the current user."""
-    user = get_seerr_user_from_request()
-    if not user:
-        return jsonify({"error": "Not authenticated"}), 401
+    seerr_user_id = g.seerr_user_id
+    lb_username = load_users().get(seerr_user_id, {}).get("letterboxd")
 
-    seerr_user_id = str(user["id"])
-    users = load_users()
-    user_data = users.get(seerr_user_id, {})
-
-    if not user_data.get("letterboxd"):
+    if not lb_username:
         return jsonify({"error": "No Letterboxd username linked"}), 400
 
-    # Check if already syncing
-    with sync_lock:
-        current = sync_status.get(seerr_user_id, {})
-        if current.get("status") == "syncing":
-            return jsonify({"error": "Sync already in progress"}), 429
+    if not _claim_sync(seerr_user_id):
+        return jsonify({"error": "Sync already in progress"}), 429
 
-        sync_status[seerr_user_id] = {"status": "syncing"}
-
-    # Run sync in background thread
-    def do_sync():
-        state = load_state()
-        try:
-            result = _sync_single_user(
-                user_data["letterboxd"], int(seerr_user_id), state,
-            )
-            save_state(state)
-            with sync_lock:
-                sync_status[seerr_user_id] = {
-                    "status": "complete",
-                    "last_sync": datetime.now(timezone.utc).isoformat(),
-                    **result,
-                }
-        except Exception as e:
-            logger.error("Manual sync failed for %s: %s", user_data["letterboxd"], e)
-            with sync_lock:
-                sync_status[seerr_user_id] = {
-                    "status": "error",
-                    "error": str(e),
-                    "last_sync": datetime.now(timezone.utc).isoformat(),
-                }
-
-    threading.Thread(target=do_sync, daemon=True).start()
+    threading.Thread(target=_run_user_sync, args=(seerr_user_id, lb_username), daemon=True).start()
     return jsonify({"ok": True, "status": "syncing"})
 
 
 @app.route("/api/status")
+@require_user
 def api_status():
     """Get sync status for the current user."""
-    user = get_seerr_user_from_request()
-    if not user:
-        return jsonify({"error": "Not authenticated"}), 401
-
-    seerr_user_id = str(user["id"])
-    with sync_lock:
-        status = sync_status.get(seerr_user_id, {})
-
-    return jsonify(status)
+    return jsonify(get_status(g.seerr_user_id))
 
 
 @app.route("/api/preview")
+@require_user
 def api_preview():
-    """Preview a Letterboxd watchlist without syncing."""
+    """
+    Preview a Letterboxd watchlist without syncing. Only fetches the
+    watchlist pages; titles come from the film cache where known.
+    """
     username = request.args.get("username", "").strip().lower()
     if not username:
         return jsonify({"error": "username required"}), 400
+    if not is_valid_username(username):
+        return jsonify({"error": "Letterboxd usernames only contain letters, numbers and underscores"}), 400
 
-    movies = _get_watchlist_cached(username)
+    try:
+        slugs = _get_slugs_cached(username)
+    except WatchlistFetchError as e:
+        return jsonify({"error": str(e)}), 502
+
+    films = read_state()["films"]
+    movies = []
+    for slug in slugs:
+        info = films.get(slug, {})
+        movies.append({
+            "slug": slug,
+            "title": info.get("title") or slug_to_title(slug),
+            "year": info.get("year"),
+        })
     return jsonify({"movies": movies, "count": len(movies)})
+
+
+def _seerr_login(data):
+    """
+    Log in to Seerr. Tries Jellyfin/Emby auth first, then local (email)
+    auth, so Jellyfin users and local Seerr users can both sign in.
+    Returns the Seerr response, or None if every method was rejected.
+    """
+    attempts = [
+        ("jellyfin", {"username": data["username"], "password": data["password"]}),
+        ("local", {"email": data["username"], "password": data["password"]}),
+    ]
+    for method, body in attempts:
+        resp = http_requests.post(f"{SEERR_URL}/api/v1/auth/{method}", json=body, timeout=10)
+        if resp.ok:
+            return resp
+        if resp.status_code in (502, 503, 504):
+            # Seerr itself is down, no point trying the next method
+            raise SeerrUnavailable()
+    return None
 
 
 @app.route("/api/login", methods=["POST"])
 def api_login():
     """
-    Authenticate with Seerr using Jellyfin credentials.
+    Authenticate with Seerr (Jellyfin/Emby or local account).
     Proxies the login to Seerr and returns the session cookie.
     """
-    data = request.get_json()
+    data = request.get_json(silent=True)
     if not data or not data.get("username") or not data.get("password"):
         return jsonify({"error": "username and password required"}), 400
 
     try:
-        resp = http_requests.post(
-            f"{SEERR_URL}/api/v1/auth/jellyfin",
-            json={"username": data["username"], "password": data["password"]},
-            headers={"Content-Type": "application/json"},
-            timeout=10,
-        )
-    except Exception as e:
+        resp = _seerr_login(data)
+    except (http_requests.RequestException, SeerrUnavailable) as e:
         logger.error("Seerr login proxy failed: %s", e)
         return jsonify({"error": "Could not reach Seerr"}), 502
 
-    if not resp.ok:
+    if resp is None:
         return jsonify({"error": "Invalid credentials"}), 401
 
-    # Extract connect.sid cookie from Seerr response
-    connect_sid = None
-    for cookie in resp.cookies:
-        if cookie.name == "connect.sid":
-            connect_sid = cookie.value
-            break
-
+    connect_sid = resp.cookies.get("connect.sid")
     if not connect_sid:
         return jsonify({"error": "Login succeeded but no session cookie returned"}), 500
 
-    # Set the cookie on our response so subsequent requests include it
-    response = make_response(jsonify({"ok": True, "user": resp.json()}))
+    response = make_response(jsonify({"ok": True}))
     response.set_cookie(
         "connect.sid",
         connect_sid,
         httponly=True,
+        secure=COOKIE_SECURE,
         samesite="Lax",
         path="/",
     )
@@ -461,6 +451,7 @@ def api_logout():
         "",
         expires=0,
         httponly=True,
+        secure=COOKIE_SECURE,
         samesite="Lax",
         path="/",
     )
@@ -471,29 +462,21 @@ def api_logout():
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
     if not SEERR_API_KEY:
         logger.error("SEERR_API_KEY is required. Set it as an environment variable.")
         return
 
     logger.info("Letterboxderr Web UI starting on %s:%d", WEB_HOST, WEB_PORT)
     logger.info("Seerr URL: %s", SEERR_URL)
+    if DRY_RUN:
+        logger.info("Dry run mode: nothing will be added to Seerr")
 
-    # Clear any stale sync status from previous runs
-    sync_status.clear()
-
-    # Start background sync thread
     if SYNC_INTERVAL > 0:
-        logger.info("Background sync enabled (every %ds)", SYNC_INTERVAL)
-        sync_thread = threading.Thread(target=sync_loop, daemon=True)
-        sync_thread.start()
+        logger.info("Background sync enabled (every %ds, first run in %ds)", SYNC_INTERVAL, FIRST_SYNC_DELAY)
+        threading.Thread(target=sync_loop, daemon=True).start()
 
-    app.run(host=WEB_HOST, port=WEB_PORT, debug=False)
+    from waitress import serve
+    serve(app, host=WEB_HOST, port=WEB_PORT, threads=8)
 
 
 if __name__ == "__main__":

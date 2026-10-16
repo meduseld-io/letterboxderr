@@ -8,9 +8,14 @@ services:
     volumes:
       - letterboxderr-data:/data
     environment:
-      - SEERR_URL=http://localhost:5055  # Change to your Seerr URL
+      # Seerr's address as seen from inside this container. "localhost" would
+      # point at the Letterboxderr container itself, so use the Seerr service
+      # name (same compose network) or the host's IP.
+      - SEERR_URL=http://seerr:5055
       - SEERR_API_KEY=                   # Your Seerr API key (Settings > General)
       - SYNC_INTERVAL=3600               # Seconds between auto-syncs (0 to disable)
+      - PUID=1000                        # Owner of files in /data
+      - PGID=1000
 
 volumes:
   letterboxderr-data:
