@@ -8,6 +8,10 @@ Sync your [Letterboxd](https://letterboxd.com) watchlist to [Seerr](https://gith
 
 Movies and TV shows from your Letterboxd watchlist are automatically added to your Seerr watchlist, so you can browse and request them whenever you're ready.
 
+**Compatibility:** Letterboxderr needs Seerr's watchlist API (`POST /api/v1/watchlist`), which Seerr and Jellyseerr provide. Overseerr's watchlist is synced from Plex and may not accept items from Letterboxderr.
+
+**Signing in:** the web UI accepts Jellyfin/Emby accounts and local Seerr accounts (email and password). Plex sign-in isn't supported yet; Plex users can still be synced with [CLI mode](#cli-mode) by mapping their Seerr user ID.
+
 ## Quick start
 
 ### Docker
@@ -20,6 +24,7 @@ docker run -d \
   -e SEERR_URL=http://your-seerr:5055 \
   -e SEERR_API_KEY=your-api-key \
   -v /path/to/data:/data \
+  -e PUID=1000 -e PGID=1000 \
   ghcr.io/meduseld-io/letterboxderr:latest
 ```
 
@@ -41,14 +46,18 @@ services:
       - SEERR_URL=http://your-seerr:5055
       - SEERR_API_KEY=your-api-key
       - SYNC_INTERVAL=3600
+      - PUID=1000
+      - PGID=1000
 ```
+
+`SEERR_URL` is resolved from inside the container, so `localhost` won't reach Seerr. Use the Seerr service name on a shared Docker network, or the host's IP.
 
 ## How it works
 
 1. Sign in with your Seerr account
 2. Enter your Letterboxd username
 3. Letterboxderr scrapes your public Letterboxd watchlist page
-4. Each movie or TV show is matched to a TMDb ID from the film page
+4. Each movie or TV show is matched to a TMDb ID from the film page (looked up once, then cached)
 5. New items are added to your Seerr watchlist
 6. Background sync runs automatically (configurable interval)
 
@@ -56,12 +65,21 @@ services:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SEERR_URL` | `http://localhost:5055` | Your Seerr/Jellyseerr/Overseerr internal URL |
+| `SEERR_URL` | `http://localhost:5055` | Your Seerr/Jellyseerr internal URL |
 | `SEERR_API_KEY` | | API key from Seerr Settings > General |
 | `SEERR_PUBLIC_URL` | | Public URL for the "Open Seerr" button (e.g. `https://requests.example.com`) |
 | `SYNC_INTERVAL` | `3600` | Seconds between auto-syncs (0 = manual only) |
+| `FIRST_SYNC_DELAY` | `60` | Seconds after startup before the first background sync |
+| `DRY_RUN` | `false` | Log what would be added without changing Seerr or the sync state |
 | `WEB_PORT` | `8484` | Port for the web UI |
-| `DRY_RUN` | `false` | Log without making changes |
+| `WEB_HOST` | `0.0.0.0` | Address the web UI listens on |
+| `COOKIE_SECURE` | `false` | Set to `true` when serving the UI over HTTPS |
+| `PUID` / `PGID` | `1000` | User and group the container runs as; owns the files in `/data` |
+| `STATE_FILE` | `state.json` (`/data/state.json` in Docker) | Sync state and cached film lookups |
+| `USERS_FILE` | `users.json` (`/data/users.json` in Docker) | Linked accounts and last sync results |
+| `CONFIG_FILE` | `config.json` | CLI mode config file |
+
+Environment variables take precedence over values in `config.json`.
 
 ## CLI mode
 
@@ -77,6 +95,14 @@ python letterboxderr.py
 
 # Run once and exit - good for cron jobs
 python letterboxderr.py --once
+```
+
+## Development
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .
+pytest
 ```
 
 ## Finding your Seerr API key

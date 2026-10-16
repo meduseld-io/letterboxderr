@@ -342,8 +342,8 @@
             <div class="card">
                 <h2>Sign in with Seerr</h2>
                 <div class="form-group">
-                    <label for="username">Username</label>
-                    <input type="text" id="username" placeholder="Your Seerr username" autocomplete="username">
+                    <label for="username">Username or email</label>
+                    <input type="text" id="username" placeholder="Jellyfin/Emby username or Seerr email" autocomplete="username">
                 </div>
                 <div class="form-group">
                     <label for="password">Password</label>
@@ -427,6 +427,13 @@
     async function init() {
         try {
             const resp = await fetch('/api/me');
+            if (resp.status === 503) {
+                showLoginView();
+                const errorEl = document.getElementById('login-error');
+                errorEl.textContent = 'Seerr is unreachable right now. Try again shortly.';
+                errorEl.classList.remove('hidden');
+                return;
+            }
             if (resp.ok) {
                 const data = await resp.json();
                 if (data.authenticated) {
@@ -452,12 +459,18 @@
         document.getElementById('main-view').classList.remove('hidden');
 
         // Set user info
-        document.getElementById('user-name').textContent = currentUser.displayName;
+        document.getElementById('user-name').textContent = currentUser.displayName + (currentUser.dry_run ? ' (dry run)' : '');
         const avatarContainer = document.getElementById('user-avatar-container');
+        const fallback = el('div', 'avatar-fallback', (currentUser.displayName || '?')[0].toUpperCase());
         if (currentUser.avatar) {
-            avatarContainer.innerHTML = `<img class="avatar" src="${currentUser.avatar}" alt="" onerror="this.parentElement.innerHTML='<div class=\\'avatar-fallback\\'>${(currentUser.displayName || '?')[0].toUpperCase()}</div>'">`;
+            const img = document.createElement('img');
+            img.className = 'avatar';
+            img.alt = '';
+            img.src = currentUser.avatar;
+            img.onerror = () => avatarContainer.replaceChildren(fallback);
+            avatarContainer.replaceChildren(img);
         } else {
-            avatarContainer.innerHTML = `<div class="avatar-fallback">${(currentUser.displayName || '?')[0].toUpperCase()}</div>`;
+            avatarContainer.replaceChildren(fallback);
         }
 
         // Show Seerr link
@@ -471,7 +484,12 @@
         if (currentUser.letterboxd) {
             document.getElementById('not-linked').classList.add('hidden');
             document.getElementById('linked').classList.remove('hidden');
-            document.getElementById('linked-username').innerHTML = `<a href="https://letterboxd.com/${currentUser.letterboxd}/" target="_blank" style="color: #ff8000; text-decoration: none;">${currentUser.letterboxd}</a>`;
+            const lbLink = el('a', null, currentUser.letterboxd);
+            lbLink.href = `https://letterboxd.com/${encodeURIComponent(currentUser.letterboxd)}/`;
+            lbLink.target = '_blank';
+            lbLink.rel = 'noopener';
+            lbLink.style.cssText = 'color: #ff8000; text-decoration: none;';
+            document.getElementById('linked-username').replaceChildren(lbLink);
             updateSyncInfo(currentUser.sync_status);
             // If status shows syncing, disable button and start polling
             if (currentUser.sync_status && currentUser.sync_status.status === 'syncing') {
@@ -619,7 +637,10 @@
                         document.getElementById('sync-btn').textContent = 'Sync Now';
                         if (status.status === 'complete') {
                             if (status.failures) lastFailures = status.failures;
-                            showToast(`Synced: ${status.added} added, ${status.skipped} already synced`);
+                            const verb = status.dry_run ? 'would add' : 'added';
+                            showToast(`Synced: ${status.added} ${verb}, ${status.skipped} already synced`);
+                        } else if (status.status === 'error') {
+                            showToast(status.error || 'Sync failed', 'error');
                         }
                     }
                 }
@@ -644,12 +665,15 @@
         else if (status.status === 'error') badge = '<span class="badge badge-error">Error</span>';
 
         let details = '';
-        if (status.added !== undefined) {
-            let failedText = `${status.failed} failed`;
+        if (status.status === 'error' && status.error) {
+            details = ` - ${esc(status.error)}`;
+        } else if (status.added !== undefined) {
+            let failedText = `${Number(status.failed)} failed`;
             if (status.failed > 0 && status.failures && status.failures.length > 0) {
-                failedText = `<a href="#" style="color: #e03030; text-decoration: underline;" onclick="showFailures(event)">${status.failed} failed</a>`;
+                failedText = `<a href="#" style="color: #e03030; text-decoration: underline;" onclick="showFailures(event)">${Number(status.failed)} failed</a>`;
             }
-            details = ` - ${status.added} added, ${status.skipped} already synced, ${failedText}`;
+            const verb = status.dry_run ? 'would add (dry run)' : 'added';
+            details = ` - ${Number(status.added)} ${verb}, ${Number(status.skipped)} already synced, ${failedText}`;
         }
         if (status.last_sync) {
             const syncDate = new Date(status.last_sync);
@@ -679,13 +703,20 @@
             const resp = await fetch(`/api/preview?username=${encodeURIComponent(username)}`);
             const data = await resp.json();
 
+            if (!resp.ok) {
+                count.textContent = '';
+                list.innerHTML = '';
+                list.appendChild(el('div', null, data.error || 'Failed to load watchlist')).style.cssText = 'color: #e03030; padding: 1rem;';
+                return;
+            }
+
             if (data.movies && data.movies.length > 0) {
                 count.textContent = `(${data.count})`;
                 count.title = 'Number of movies on the watchlist';
                 list.innerHTML = data.movies.map(m =>
                     `<div class="preview-item">
-                        <span>${m.title}</span>
-                        <span class="year">${m.year || ''}</span>
+                        <span>${esc(m.title)}</span>
+                        <span class="year">${esc(m.year || '')}</span>
                     </div>`
                 ).join('');
             } else {
@@ -714,8 +745,8 @@
         modal.innerHTML = `<h3>Failed items (${lastFailures.length})</h3>` +
             lastFailures.map(f =>
                 `<div class="failure-item">
-                    <div class="title">${f.title}</div>
-                    <div class="reason">${f.reason}</div>
+                    <div class="title">${esc(f.title)}</div>
+                    <div class="reason">${esc(f.reason)}</div>
                 </div>`
             ).join('') +
             `<button class="btn btn-outline btn-block" style="margin-top: 1rem;" onclick="this.closest('.failures-overlay').remove()">Close</button>`;
@@ -725,6 +756,20 @@
     }
 
     // ------ Helpers ------
+    // Escape text for use inside an HTML template string
+    function esc(value) {
+        return String(value ?? '').replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+        })[c]);
+    }
+
+    function el(tag, className, text) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (text !== undefined) node.textContent = text;
+        return node;
+    }
+
     function showToast(msg, type = 'success') {
         const el = document.getElementById('toast');
         el.textContent = msg;
