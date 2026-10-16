@@ -266,6 +266,45 @@
 
         .hidden { display: none; }
 
+        /* Sync options */
+        .options-card h3 {
+            font-size: 0.95rem;
+            margin: 1.2rem 0 0.6rem;
+            color: #d8d8d8;
+        }
+        .options-card h3:first-of-type { margin-top: 0; }
+        .option {
+            display: flex;
+            gap: 0.6rem;
+            align-items: flex-start;
+            padding: 0.4rem 0;
+            font-size: 0.9rem;
+            cursor: pointer;
+        }
+        .option input { margin-top: 0.2rem; accent-color: #ff8000; }
+        .option .hint { display: block; color: #9ab; font-size: 0.8rem; }
+        .list-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.4rem 0;
+            border-bottom: 1px solid #2c3440;
+            font-size: 0.9rem;
+            word-break: break-all;
+        }
+        .list-row a { color: #d8d8d8; text-decoration: none; }
+        .list-add { display: flex; gap: 0.5rem; margin-top: 0.6rem; }
+        .list-add input { flex: 1; }
+        .btn-small { padding: 0.3rem 0.8rem; font-size: 0.8rem; }
+        .divider {
+            text-align: center;
+            color: #556;
+            font-size: 0.8rem;
+            margin: 1rem 0;
+        }
+        .btn-plex { background: #e5a00d; color: #14181c; }
+
         .spinner {
             display: inline-block;
             width: 14px;
@@ -350,6 +389,8 @@
                     <input type="password" id="password" placeholder="Your Seerr password" autocomplete="current-password">
                 </div>
                 <button class="btn btn-primary btn-block" id="login-btn" onclick="login()">Sign In</button>
+                <div class="divider">or</div>
+                <button class="btn btn-plex btn-block" id="plex-btn" onclick="plexLogin()">Sign in with Plex</button>
                 <p id="login-error" class="hidden" style="color: #e03030; font-size: 0.85rem; margin-top: 0.8rem;"></p>
             </div>
         </div>
@@ -400,6 +441,31 @@
                         </button>
                     </div>
                     <div class="sync-info" id="sync-info"></div>
+                </div>
+            </div>
+
+            <!-- Options card -->
+            <div class="card options-card hidden" id="options-card">
+                <h3>Sync options</h3>
+                <label class="option" id="auto-request-option">
+                    <input type="checkbox" id="opt-auto-request" onchange="saveSettings({auto_request: this.checked})">
+                    <span>Also request new titles
+                        <span class="hint">Titles you add to Letterboxd from now on are requested in Seerr, not just added to your watchlist.</span>
+                    </span>
+                </label>
+                <label class="option">
+                    <input type="checkbox" id="opt-remove-missing" onchange="saveSettings({remove_missing: this.checked})">
+                    <span>Remove titles I remove from Letterboxd
+                        <span class="hint">Only titles Letterboxderr added to your Seerr watchlist are removed. Requests are never cancelled.</span>
+                    </span>
+                </label>
+
+                <h3>Letterboxd lists</h3>
+                <p style="color: #9ab; font-size: 0.85rem;">Films on these lists are synced along with your watchlist.</p>
+                <div id="lists"></div>
+                <div class="list-add form-group">
+                    <input type="text" id="list-input" placeholder="https://letterboxd.com/user/list/list-name/">
+                    <button class="btn btn-outline btn-small" onclick="addList()">Add</button>
                 </div>
             </div>
 
@@ -491,6 +557,7 @@
             lbLink.style.cssText = 'color: #ff8000; text-decoration: none;';
             document.getElementById('linked-username').replaceChildren(lbLink);
             updateSyncInfo(currentUser.sync_status);
+            renderOptions();
             // If status shows syncing, disable button and start polling
             if (currentUser.sync_status && currentUser.sync_status.status === 'syncing') {
                 document.getElementById('sync-btn').disabled = true;
@@ -500,6 +567,7 @@
         } else {
             document.getElementById('not-linked').classList.remove('hidden');
             document.getElementById('linked').classList.add('hidden');
+            document.getElementById('options-card').classList.add('hidden');
         }
     }
 
@@ -573,8 +641,9 @@
 
             if (resp.ok) {
                 currentUser.letterboxd = data.letterboxd;
+                currentUser.sync_status = data.syncing ? { status: 'syncing' } : {};
                 showMainView();
-                showToast('Letterboxd account linked');
+                showToast(data.syncing ? 'Letterboxd account linked, syncing now' : 'Letterboxd account linked');
             } else {
                 showToast(data.error || 'Link failed', 'error');
             }
@@ -653,7 +722,7 @@
     function updateSyncInfo(status) {
         const el = document.getElementById('sync-info');
         if (!status || !status.status) {
-            el.innerHTML = '<span style="color: #556;">No sync yet - press Sync Now to start</span>';
+            el.innerHTML = '<span style="color: #556;">No sync yet - press Sync Now to start</span>' + nextSyncText();
             return;
         }
 
@@ -674,6 +743,8 @@
             }
             const verb = status.dry_run ? 'would add (dry run)' : 'added';
             details = ` - ${Number(status.added)} ${verb}, ${Number(status.skipped)} already synced, ${failedText}`;
+            if (status.requested) details += `, ${Number(status.requested)} requested`;
+            if (status.removed) details += `, ${Number(status.removed)} removed`;
         }
         if (status.last_sync) {
             const syncDate = new Date(status.last_sync);
@@ -681,7 +752,15 @@
             details += ` (${ago})`;
         }
 
-        el.innerHTML = badge + details;
+        el.innerHTML = badge + details + nextSyncText();
+    }
+
+    function nextSyncText() {
+        if (!currentUser || !currentUser.next_sync) return '';
+        const mins = Math.round((new Date(currentUser.next_sync) - new Date()) / 60000);
+        if (mins <= 0) return '<br>Next automatic sync: any moment now';
+        if (mins < 60) return `<br>Next automatic sync in ${mins}m`;
+        return `<br>Next automatic sync in ${Math.floor(mins / 60)}h ${mins % 60}m`;
     }
 
     // ------ Preview ------
@@ -753,6 +832,119 @@
 
         overlay.appendChild(modal);
         document.body.appendChild(overlay);
+    }
+
+    // ------ Options ------
+    function renderOptions() {
+        const settings = currentUser.settings || { lists: [] };
+        document.getElementById('options-card').classList.remove('hidden');
+        document.getElementById('auto-request-option').classList.toggle('hidden', !currentUser.allow_auto_request);
+        document.getElementById('opt-auto-request').checked = !!settings.auto_request;
+        document.getElementById('opt-remove-missing').checked = !!settings.remove_missing;
+
+        const container = document.getElementById('lists');
+        container.replaceChildren();
+        if (!settings.lists.length) {
+            container.appendChild(el('div', 'hint', 'No lists added.')).style.cssText = 'color: #556; font-size: 0.85rem;';
+        }
+        settings.lists.forEach(ref => {
+            const row = el('div', 'list-row');
+            const link = el('a', null, ref);
+            const [owner, slug] = ref.split('/');
+            link.href = `https://letterboxd.com/${encodeURIComponent(owner)}/list/${encodeURIComponent(slug)}/`;
+            link.target = '_blank';
+            link.rel = 'noopener';
+            const remove = el('button', 'btn btn-outline btn-small', 'Remove');
+            remove.onclick = () => saveSettings({ lists: settings.lists.filter(r => r !== ref) });
+            row.append(link, remove);
+            container.appendChild(row);
+        });
+        document.getElementById('list-input').disabled = settings.lists.length >= currentUser.max_lists;
+    }
+
+    async function saveSettings(changes) {
+        try {
+            const resp = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(changes),
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                currentUser.settings = data.settings;
+                showToast('Saved. Applies from the next sync');
+                renderOptions();
+                return true;
+            }
+            showToast(data.error || 'Could not save', 'error');
+        } catch (e) {
+            console.error('Save settings failed:', e);
+            showToast('Could not reach server', 'error');
+        }
+        renderOptions();
+        return false;
+    }
+
+    async function addList() {
+        const input = document.getElementById('list-input');
+        const value = input.value.trim();
+        if (!value) return;
+        const lists = [...(currentUser.settings.lists || []), value];
+        if (await saveSettings({ lists })) input.value = '';
+    }
+
+    // ------ Plex sign-in ------
+    async function plexLogin() {
+        const errorEl = document.getElementById('login-error');
+        const btn = document.getElementById('plex-btn');
+        errorEl.classList.add('hidden');
+        // Open the window now, inside the click, so popup blockers allow it
+        const popup = window.open('', 'plex-auth', 'width=600,height=700');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Waiting for Plex...';
+
+        const fail = (msg) => {
+            if (popup && !popup.closed) popup.close();
+            errorEl.textContent = msg;
+            errorEl.classList.remove('hidden');
+            btn.disabled = false;
+            btn.textContent = 'Sign in with Plex';
+        };
+
+        let pin;
+        try {
+            const resp = await fetch('/api/plex/pin', { method: 'POST' });
+            pin = await resp.json();
+            if (!resp.ok) return fail(pin.error || 'Could not start Plex sign-in');
+        } catch (e) {
+            return fail('Could not reach server');
+        }
+        if (popup) popup.location = pin.auth_url;
+        else window.location.href = pin.auth_url;
+
+        const started = Date.now();
+        while (Date.now() - started < 5 * 60 * 1000) {
+            await new Promise(r => setTimeout(r, 2000));
+            if (popup && popup.closed) {
+                // Give Plex one last check in case the window closed itself after approving
+                const last = await fetch(`/api/plex/pin/${pin.id}`).then(r => r.json().then(d => [r, d])).catch(() => null);
+                if (last && last[0].ok && last[1].ok) break;
+                return fail('Plex sign-in was cancelled');
+            }
+            try {
+                const resp = await fetch(`/api/plex/pin/${pin.id}`);
+                const data = await resp.json();
+                if (!resp.ok) return fail(data.error || 'Plex sign-in failed');
+                if (data.ok) break;
+            } catch (e) {
+                console.error('Plex poll failed:', e);
+            }
+        }
+        if (popup && !popup.closed) popup.close();
+        btn.disabled = false;
+        btn.textContent = 'Sign in with Plex';
+        await init();
+        if (!currentUser) fail('Plex sign-in timed out');
     }
 
     // ------ Helpers ------

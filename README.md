@@ -10,7 +10,7 @@ Movies and TV shows from your Letterboxd watchlist are automatically added to yo
 
 **Compatibility:** Letterboxderr needs Seerr's watchlist API (`POST /api/v1/watchlist`), which Seerr and Jellyseerr provide. Overseerr's watchlist is synced from Plex and may not accept items from Letterboxderr.
 
-**Signing in:** the web UI accepts Jellyfin/Emby accounts and local Seerr accounts (email and password). Plex sign-in isn't supported yet; Plex users can still be synced with [CLI mode](#cli-mode) by mapping their Seerr user ID.
+**Signing in:** the web UI accepts Plex accounts, Jellyfin/Emby accounts and local Seerr accounts (email and password). Plex sign-in needs the Letterboxderr server to reach `plex.tv`.
 
 ## Quick start
 
@@ -59,7 +59,15 @@ services:
 3. Letterboxderr scrapes your public Letterboxd watchlist page
 4. Each movie or TV show is matched to a TMDb ID from the film page (looked up once, then cached)
 5. New items are added to your Seerr watchlist
-6. Background sync runs automatically (configurable interval)
+6. Background sync runs automatically (configurable interval); linking an account starts a sync straight away
+
+### Sync options
+
+Each user can turn these on in the web UI (or per user in `config.json` for CLI mode):
+
+- **Letterboxd lists:** sync films from any public Letterboxd list along with the watchlist. Paste the list's URL.
+- **Also request new titles:** titles added to Letterboxd after this is turned on are requested in Seerr as that user, not just added to their watchlist. Seerr's permissions, quotas and auto-approve settings for the user still apply. The first sync with it on only records what's already there, so turning it on never requests a whole existing watchlist. Server admins can disable it with `ALLOW_AUTO_REQUEST=false`.
+- **Remove titles I remove from Letterboxd:** titles Letterboxderr added to the Seerr watchlist are removed once they're no longer on the watchlist or any synced list. Titles you added in Seerr yourself are never touched, and requests are never cancelled. If a sync finds no films at all, removals are skipped in case Letterboxd's page changed.
 
 ## Configuration
 
@@ -70,7 +78,10 @@ services:
 | `SEERR_PUBLIC_URL` | | Public URL for the "Open Seerr" button (e.g. `https://requests.example.com`) |
 | `SYNC_INTERVAL` | `3600` | Seconds between auto-syncs (0 = manual only) |
 | `FIRST_SYNC_DELAY` | `60` | Seconds after startup before the first background sync |
-| `DRY_RUN` | `false` | Log what would be added without changing Seerr or the sync state |
+| `DRY_RUN` | `false` | Log what would be added, requested or removed without changing Seerr or the sync state |
+| `ALLOW_AUTO_REQUEST` | `true` | Let users turn on auto-request |
+| `MAX_LISTS` | `10` | Most Letterboxd lists one user can sync |
+| `PLEX_CLIENT_ID` | derived from `SEERR_URL` | Identifier this install uses when signing in with Plex |
 | `WEB_PORT` | `8484` | Port for the web UI |
 | `WEB_HOST` | `0.0.0.0` | Address the web UI listens on |
 | `COOKIE_SECURE` | `false` | Set to `true` when serving the UI over HTTPS |
@@ -96,6 +107,8 @@ python letterboxderr.py
 # Run once and exit - good for cron jobs
 python letterboxderr.py --once
 ```
+
+Each user in `config.json` can also set `lists` (list URLs or `owner/list-name`), `auto_request` and `remove_missing`. See `config.example.json`.
 
 ## Development
 

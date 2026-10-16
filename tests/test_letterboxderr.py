@@ -67,12 +67,12 @@ def test_film_cache_skips_known_film_pages():
 def test_state_migrates_old_format(isolated_files):
     (isolated_files / "state.json").write_text(json.dumps({"alice:1": [10, 20]}))
     state = lb.load_state()
-    assert state == {"synced": {"alice:1": ["movie:10", "movie:20"]}, "films": {}}
+    assert state == {**lb.empty_state(), "synced": {"alice:1": ["movie:10", "movie:20"]}}
 
 
 def test_corrupt_state_is_moved_aside(isolated_files):
     (isolated_files / "state.json").write_text("{not json")
-    assert lb.load_state() == {"synced": {}, "films": {}}
+    assert lb.load_state() == lb.empty_state()
     assert (isolated_files / "state.json.corrupt").exists()
 
 
@@ -156,3 +156,119 @@ def test_config_file_used_when_env_unset(isolated_files, monkeypatch):
     config = lb.load_config()
     assert config["sync_interval"] == 60
     assert config["seerr_url"] == "http://file:5055"
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("https://letterboxd.com/Dave/list/official-top-250/", "dave/official-top-250"),
+    ("letterboxd.com/dave/list/top-250", "dave/top-250"),
+    ("dave/top-250", "dave/top-250"),
+    ("dave/list/top-250", "dave/top-250"),
+    ("https://evil.com/dave/list/x/", None),
+    ("dave/../x", None),
+    ("", None),
+])
+def test_parse_list_ref(value, expected):
+    assert lb.parse_list_ref(value) == expected
+
+
+def test_lists_are_merged_with_watchlist(monkeypatch):
+    client = FakeClient({
+        WL.format(1): watchlist_page(["/film/a/"]),
+        "https://letterboxd.com/bob/list/faves/page/1/": watchlist_page(["/film/a/", "/film/b/"]),
+        "https://letterboxd.com/film/a/": film_page(1, "A (2000)"),
+        "https://letterboxd.com/film/b/": film_page(2, "B (2000)"),
+    })
+    movies = lb.fetch_letterboxd_watchlist("alice", {}, client, lists=["bob/faves"])
+    assert [m["tmdb_id"] for m in movies] == [1, 2]
+
+
+class FeatureHarness(SyncHarness):
+    def __init__(self, monkeypatch, films):
+        self.films = dict(films)
+        self.requested = []
+        self.removed = []
+        super().__init__(monkeypatch, self.films)
+        harness = self
+
+        def fake_request(tmdb_id, title, url, key, user, media_type):
+            harness.requested.append(lb.media_key(media_type, tmdb_id))
+            return True, None
+
+        def fake_remove(tmdb_id, title, url, key, user):
+            harness.removed.append(tmdb_id)
+            return True
+        monkeypatch.setattr(lb, "request_media", fake_request)
+        monkeypatch.setattr(lb, "remove_from_seerr_watchlist", fake_remove)
+        self.monkeypatch = monkeypatch
+
+    def set_watchlist(self, films):
+        """Replace the watchlist contents; film pages stay resolvable."""
+        self.films.update(films)
+        pages = {WL.format(1): watchlist_page(list(films))}
+        for slug, (tmdb_id, media_type) in self.films.items():
+            pages[f"https://letterboxd.com{slug}"] = film_page(tmdb_id, f"{slug} (2000)", media_type)
+        client = FakeClient(pages)
+        self.monkeypatch.setattr(lb, "make_client", lambda: client)
+
+
+def test_auto_request_first_run_is_a_baseline(monkeypatch):
+    h = FeatureHarness(monkeypatch, {"/film/a/": (1, "movie")})
+    h.sync()  # plain sync, a is on the watchlist
+    result = h.sync(auto_request=True)
+    assert result["requested"] == 0 and h.requested == []
+
+    h.set_watchlist({"/film/a/": (1, "movie"), "/film/b/": (2, "tv")})
+    result = h.sync(auto_request=True)
+    assert h.requested == ["tv:2"]
+    assert result["requested"] == 1
+
+    h.sync(auto_request=True)
+    assert h.requested == ["tv:2"]  # not requested twice
+
+
+def test_auto_request_failure_is_retried(monkeypatch):
+    h = FeatureHarness(monkeypatch, {})
+    h.sync(auto_request=True)  # baseline with an empty watchlist
+    h.set_watchlist({"/film/a/": (1, "movie")})
+    monkeypatch.setattr(lb, "request_media", lambda *a: (False, "quota exceeded"))
+    result = h.sync(auto_request=True)
+    assert result["failures"] == [{"title": "/film/a/", "reason": "quota exceeded"}]
+
+    calls = []
+    monkeypatch.setattr(lb, "request_media", lambda *a: (calls.append(a[0]) or (True, None)))
+    h.sync(auto_request=True)
+    assert calls == [1]
+
+
+def test_remove_missing_only_removes_titles_we_added(monkeypatch):
+    h = FeatureHarness(monkeypatch, {"/film/a/": (1, "movie"), "/film/b/": (2, "movie")})
+    monkeypatch.setattr(lb, "get_seerr_watchlist", lambda *a: {"movie:2", "movie:99"})
+    h.sync(remove_missing=True)  # adds a; b and 99 were already there
+    assert h.added == ["movie:1"]
+
+    h.set_watchlist({"/film/c/": (3, "movie")})
+    result = h.sync(remove_missing=True)
+    assert h.removed == [1]
+    assert result["removed"] == 1
+    assert "movie:1" not in lb.load_state()["synced"]["alice:1"]
+
+    # Re-adding it on Letterboxd adds it to Seerr again
+    h.set_watchlist({"/film/a/": (1, "movie"), "/film/c/": (3, "movie")})
+    h.sync(remove_missing=True)
+    assert h.added.count("movie:1") == 2
+
+
+def test_remove_missing_skips_when_nothing_found(monkeypatch):
+    h = FeatureHarness(monkeypatch, {"/film/a/": (1, "movie")})
+    h.sync(remove_missing=True)
+    h.set_watchlist({})
+    h.sync(remove_missing=True)
+    assert h.removed == []
+
+
+def test_remove_missing_off_removes_nothing(monkeypatch):
+    h = FeatureHarness(monkeypatch, {"/film/a/": (1, "movie")})
+    h.sync()
+    h.set_watchlist({"/film/b/": (2, "movie")})
+    h.sync()
+    assert h.removed == []

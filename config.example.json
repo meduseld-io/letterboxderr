@@ -5,7 +5,10 @@
   "users": [
     {
       "letterboxd": "your-letterboxd-username",
-      "seerr_user_id": 1
+      "seerr_user_id": 1,
+      "lists": ["https://letterboxd.com/your-letterboxd-username/list/my-list/"],
+      "auto_request": false,
+      "remove_missing": false
     }
   ]
 }
