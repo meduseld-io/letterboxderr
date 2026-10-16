@@ -10,12 +10,15 @@ username, and trigger syncs from the browser.
 import json
 import logging
 import os
+import secrets
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlencode
 
 import requests as http_requests
 from flask import Flask, g, jsonify, make_response, request, send_from_directory
@@ -28,6 +31,7 @@ from letterboxderr import (
     forget_user,
     is_valid_username,
     make_client,
+    parse_list_ref,
     read_state,
     slug_to_title,
     sync_watchlist,
@@ -48,6 +52,11 @@ USERS_FILE = os.environ.get("USERS_FILE", "users.json")
 SYNC_INTERVAL = env_int("SYNC_INTERVAL", 3600)
 FIRST_SYNC_DELAY = env_int("FIRST_SYNC_DELAY", 60)
 COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
+ALLOW_AUTO_REQUEST = os.environ.get("ALLOW_AUTO_REQUEST", "true").lower() == "true"
+MAX_LISTS = env_int("MAX_LISTS", 10)
+# Identifies this install to Plex during sign-in; stable across restarts
+PLEX_CLIENT_ID = os.environ.get("PLEX_CLIENT_ID") or str(uuid.uuid5(uuid.NAMESPACE_URL, f"letterboxderr:{SEERR_URL}"))
+PLEX_PRODUCT = "Letterboxderr"
 
 
 class SeerrUnavailable(Exception):
@@ -157,10 +166,20 @@ def _claim_sync(seerr_user_id):
         return True
 
 
+def user_settings(user_data):
+    """A user's sync options, with server-side limits applied."""
+    return {
+        "lists": list(user_data.get("lists", [])),
+        "auto_request": bool(user_data.get("auto_request")) and ALLOW_AUTO_REQUEST,
+        "remove_missing": bool(user_data.get("remove_missing")),
+    }
+
+
 def _run_user_sync(seerr_user_id, lb_username):
     """Sync one user (already claimed) and record the result."""
     try:
-        result = sync_watchlist(lb_username, int(seerr_user_id), SEERR_URL, SEERR_API_KEY)
+        settings = user_settings(load_users().get(seerr_user_id, {}))
+        result = sync_watchlist(lb_username, int(seerr_user_id), SEERR_URL, SEERR_API_KEY, **settings)
         status = {"status": "complete", "last_sync": _now(), **result}
     except WatchlistFetchError as e:
         logger.error("Sync failed for %s: %s", lb_username, e)
@@ -191,14 +210,29 @@ def background_sync_all():
         _run_user_sync(seerr_user_id, lb_username)
 
 
+def _start_sync(seerr_user_id, lb_username):
+    """Start a sync in the background. Returns False if one is already running."""
+    if not _claim_sync(seerr_user_id):
+        return False
+    threading.Thread(target=_run_user_sync, args=(seerr_user_id, lb_username), daemon=True).start()
+    return True
+
+
+next_sync_at = None  # epoch seconds of the next background sync, if enabled
+
+
 def sync_loop():
     """Background thread that syncs all users on an interval."""
+    global next_sync_at
+    next_sync_at = time.time() + FIRST_SYNC_DELAY
     time.sleep(FIRST_SYNC_DELAY)
     while True:
+        next_sync_at = None
         try:
             background_sync_all()
         except Exception:
             logger.exception("Sync loop error")
+        next_sync_at = time.time() + SYNC_INTERVAL
         time.sleep(SYNC_INTERVAL)
 
 
@@ -261,9 +295,17 @@ def api_me():
         "avatar": user.get("avatar"),
         "letterboxd": user_data.get("letterboxd", ""),
         "sync_status": get_status(g.seerr_user_id) if user_data else {},
+        "settings": user_settings(user_data),
+        "allow_auto_request": ALLOW_AUTO_REQUEST,
+        "max_lists": MAX_LISTS,
+        "next_sync": _iso(next_sync_at),
         "seerr_url": SEERR_PUBLIC_URL or SEERR_URL,
         "dry_run": DRY_RUN,
     })
+
+
+def _iso(epoch):
+    return datetime.fromtimestamp(epoch, UTC).isoformat() if epoch else None
 
 
 @app.route("/api/link", methods=["POST"])
@@ -294,11 +336,16 @@ def api_link():
 
     def link(users):
         previous.update(users.get(seerr_user_id, {}))
-        users[seerr_user_id] = {
+        entry = {
             "letterboxd": lb_username,
             "seerr_display_name": g.user.get("displayName") or g.user.get("username", ""),
             "linked_at": _now(),
         }
+        # Keep list and option choices across a relink
+        for field in ("lists", "auto_request", "remove_missing"):
+            if field in previous:
+                entry[field] = previous[field]
+        users[seerr_user_id] = entry
     update_users(link)
 
     old_username = previous.get("letterboxd")
@@ -309,7 +356,45 @@ def api_link():
                 sync_status.pop(seerr_user_id, None)
 
     logger.info("User %s (Seerr #%s) linked Letterboxd: %s", g.user.get("displayName", "?"), seerr_user_id, lb_username)
-    return jsonify({"ok": True, "letterboxd": lb_username})
+    syncing = _start_sync(seerr_user_id, lb_username)
+    return jsonify({"ok": True, "letterboxd": lb_username, "syncing": syncing})
+
+
+@app.route("/api/settings", methods=["POST"])
+@require_user
+def api_settings():
+    """Update the current user's lists and sync options."""
+    data = request.get_json(silent=True) or {}
+    seerr_user_id = g.seerr_user_id
+    if not load_users().get(seerr_user_id, {}).get("letterboxd"):
+        return jsonify({"error": "No Letterboxd username linked"}), 400
+
+    changes = {}
+    if "lists" in data:
+        if not isinstance(data["lists"], list):
+            return jsonify({"error": "lists must be a list"}), 400
+        lists = []
+        for value in data["lists"]:
+            ref = parse_list_ref(str(value))
+            if not ref:
+                return jsonify({"error": f"Not a Letterboxd list: {value}"}), 400
+            if ref not in lists:
+                lists.append(ref)
+        if len(lists) > MAX_LISTS:
+            return jsonify({"error": f"You can sync up to {MAX_LISTS} lists"}), 400
+        changes["lists"] = lists
+    if "auto_request" in data:
+        if data["auto_request"] and not ALLOW_AUTO_REQUEST:
+            return jsonify({"error": "Auto-request is turned off on this server"}), 403
+        changes["auto_request"] = bool(data["auto_request"])
+    if "remove_missing" in data:
+        changes["remove_missing"] = bool(data["remove_missing"])
+
+    def apply(users):
+        if seerr_user_id in users:
+            users[seerr_user_id].update(changes)
+    users = update_users(apply)
+    return jsonify({"ok": True, "settings": user_settings(users.get(seerr_user_id, {}))})
 
 
 @app.route("/api/unlink", methods=["POST"])
@@ -343,10 +428,8 @@ def api_sync():
     if not lb_username:
         return jsonify({"error": "No Letterboxd username linked"}), 400
 
-    if not _claim_sync(seerr_user_id):
+    if not _start_sync(seerr_user_id, lb_username):
         return jsonify({"error": "Sync already in progress"}), 429
-
-    threading.Thread(target=_run_user_sync, args=(seerr_user_id, lb_username), daemon=True).start()
     return jsonify({"ok": True, "status": "syncing"})
 
 
@@ -425,8 +508,12 @@ def api_login():
 
     if resp is None:
         return jsonify({"error": "Invalid credentials"}), 401
+    return _session_response(resp)
 
-    connect_sid = resp.cookies.get("connect.sid")
+
+def _session_response(seerr_resp):
+    """Pass Seerr's session cookie from a successful login on to the browser."""
+    connect_sid = seerr_resp.cookies.get("connect.sid")
     if not connect_sid:
         return jsonify({"error": "Login succeeded but no session cookie returned"}), 500
 
@@ -440,6 +527,87 @@ def api_login():
         path="/",
     )
     return response
+
+
+# ---------------------------------------------------------------------------
+# Plex sign-in (PIN flow): the browser opens Plex's auth page for a PIN we
+# created, we poll the PIN until Plex attaches a token, then log in to
+# Seerr with that token. Each PIN is bound to the browser that created it.
+# ---------------------------------------------------------------------------
+_PLEX_PIN_TTL = 900
+_plex_pins = {}  # {pin_id: {"nonce": str, "created": float}}
+_plex_lock = threading.Lock()
+
+
+def _plex_headers():
+    return {
+        "Accept": "application/json",
+        "X-Plex-Product": PLEX_PRODUCT,
+        "X-Plex-Client-Identifier": PLEX_CLIENT_ID,
+    }
+
+
+@app.route("/api/plex/pin", methods=["POST"])
+def api_plex_pin():
+    """Create a Plex PIN and return the URL the user should sign in at."""
+    try:
+        resp = http_requests.post("https://plex.tv/api/v2/pins?strong=true", headers=_plex_headers(), timeout=10)
+        resp.raise_for_status()
+        pin = resp.json()
+    except (http_requests.RequestException, ValueError) as e:
+        logger.error("Could not create Plex PIN: %s", e)
+        return jsonify({"error": "Could not reach Plex"}), 502
+
+    nonce = secrets.token_urlsafe(24)
+    now = time.time()
+    with _plex_lock:
+        for pin_id in [k for k, v in _plex_pins.items() if now - v["created"] > _PLEX_PIN_TTL]:
+            del _plex_pins[pin_id]
+        _plex_pins[pin["id"]] = {"nonce": nonce, "created": now}
+
+    auth_url = "https://app.plex.tv/auth#?" + urlencode({
+        "clientID": PLEX_CLIENT_ID,
+        "code": pin["code"],
+        "context[device][product]": PLEX_PRODUCT,
+    })
+    response = make_response(jsonify({"id": pin["id"], "auth_url": auth_url}))
+    response.set_cookie(
+        "lbx_plex_pin", nonce, max_age=_PLEX_PIN_TTL, httponly=True, secure=COOKIE_SECURE, samesite="Lax", path="/",
+    )
+    return response
+
+
+@app.route("/api/plex/pin/<int:pin_id>")
+def api_plex_pin_check(pin_id):
+    """Check a PIN. Once Plex has authorised it, sign in to Seerr with the token."""
+    with _plex_lock:
+        entry = _plex_pins.get(pin_id)
+    nonce = request.cookies.get("lbx_plex_pin", "")
+    if not entry or not secrets.compare_digest(entry["nonce"], nonce):
+        return jsonify({"error": "Unknown or expired sign-in attempt"}), 404
+
+    try:
+        resp = http_requests.get(f"https://plex.tv/api/v2/pins/{pin_id}", headers=_plex_headers(), timeout=10)
+        resp.raise_for_status()
+        token = resp.json().get("authToken")
+    except (http_requests.RequestException, ValueError) as e:
+        logger.error("Could not check Plex PIN: %s", e)
+        return jsonify({"error": "Could not reach Plex"}), 502
+
+    if not token:
+        return jsonify({"status": "pending"})
+
+    with _plex_lock:
+        _plex_pins.pop(pin_id, None)
+
+    try:
+        seerr_resp = http_requests.post(f"{SEERR_URL}/api/v1/auth/plex", json={"authToken": token}, timeout=15)
+    except http_requests.RequestException as e:
+        logger.error("Seerr Plex login failed: %s", e)
+        return jsonify({"error": "Could not reach Seerr"}), 502
+    if not seerr_resp.ok:
+        return jsonify({"error": "Seerr didn't accept this Plex account"}), 401
+    return _session_response(seerr_resp)
 
 
 @app.route("/api/logout", methods=["POST"])

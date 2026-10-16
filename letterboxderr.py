@@ -117,9 +117,14 @@ def http_get(client, url, retries=3, **kwargs):
 # {
 #   "synced": {"<letterboxd>:<seerr_user>": ["movie:123", "tv:456", ...]},
 #   "films":  {"/film/slug/": {"tmdb_id": 123, "media_type": "movie",
-#                              "title": "...", "year": 2024}}
+#                              "title": "...", "year": 2024}},
+#   "added":     {"<letterboxd>:<seerr_user>": ["movie:123", ...]},
+#   "requested": {"<letterboxd>:<seerr_user>": ["movie:123", ...]}
 # }
 #
+# "synced" is everything known to be on the Seerr watchlist; "added" is the
+# subset Letterboxderr put there itself, the only items two-way sync may
+# remove. "requested" is what auto-request has already requested.
 # "films" caches each film page lookup, since a film's TMDb ID never changes.
 # ---------------------------------------------------------------------------
 _state_lock = threading.Lock()
@@ -130,20 +135,27 @@ def media_key(media_type, tmdb_id):
     return f"{media_type}:{tmdb_id}"
 
 
+STATE_SECTIONS = ("synced", "films", "added", "requested")
+
+
+def empty_state():
+    return {section: {} for section in STATE_SECTIONS}
+
+
 def _migrate_state(raw):
     """Convert the pre-0.2 format {key: [tmdb_id, ...]} to the current one."""
     if not isinstance(raw, dict):
-        return {"synced": {}, "films": {}}
+        return empty_state()
     if "synced" in raw or "films" in raw:
-        raw.setdefault("synced", {})
-        raw.setdefault("films", {})
+        for section in STATE_SECTIONS:
+            raw.setdefault(section, {})
         return raw
-    synced = {}
+    state = empty_state()
     for key, ids in raw.items():
         if isinstance(ids, list):
             # Old state only ever stored movie IDs in practice
-            synced[key] = [i if isinstance(i, str) else media_key("movie", i) for i in ids]
-    return {"synced": synced, "films": {}}
+            state["synced"][key] = [i if isinstance(i, str) else media_key("movie", i) for i in ids]
+    return state
 
 
 def load_state():
@@ -160,7 +172,7 @@ def load_state():
                 logger.error("Moved unreadable state file to %s", backup)
             except OSError:
                 pass
-    return {"synced": {}, "films": {}}
+    return empty_state()
 
 
 def write_json_atomic(path, data):
@@ -269,6 +281,28 @@ def slug_to_title(slug):
     return name.replace("-", " ").title()
 
 
+LIST_SLUG_RE = re.compile(r"^[a-z0-9-]{1,100}$")
+LIST_URL_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:letterboxd\.com/)?([A-Za-z0-9_]{1,30})/list/([a-z0-9-]{1,100})/?$"
+)
+
+
+def parse_list_ref(value):
+    """
+    Normalise a Letterboxd list reference to "owner/list-slug". Accepts
+    "owner/list-slug", "owner/list/list-slug" or a full list URL.
+    Returns None if it isn't a valid list reference.
+    """
+    value = (value or "").strip()
+    match = LIST_URL_RE.match(value)
+    if match:
+        return f"{match.group(1).lower()}/{match.group(2)}"
+    parts = value.strip("/").split("/")
+    if len(parts) == 2 and is_valid_username(parts[0]) and LIST_SLUG_RE.match(parts[1]):
+        return f"{parts[0].lower()}/{parts[1]}"
+    return None
+
+
 def fetch_watchlist_slugs(username, client=None):
     """
     Fetch the film slugs ("/film/slug/") on a user's watchlist, in order,
@@ -276,16 +310,39 @@ def fetch_watchlist_slugs(username, client=None):
     """
     if not is_valid_username(username):
         raise WatchlistFetchError(f"Invalid Letterboxd username: {username!r}")
+    return _fetch_poster_slugs(
+        f"https://letterboxd.com/{username}/watchlist",
+        f"watchlist for '{username}'",
+        f"Letterboxd user '{username}' not found",
+        client,
+    )
 
+
+def fetch_list_slugs(list_ref, client=None):
+    """Fetch the film slugs on a Letterboxd list ("owner/list-slug")."""
+    ref = parse_list_ref(list_ref)
+    if not ref:
+        raise WatchlistFetchError(f"Invalid Letterboxd list: {list_ref!r}")
+    owner, slug = ref.split("/")
+    return _fetch_poster_slugs(
+        f"https://letterboxd.com/{owner}/list/{slug}",
+        f"list '{ref}'",
+        f"Letterboxd list '{ref}' not found",
+        client,
+    )
+
+
+def _fetch_poster_slugs(base_url, label, not_found_message, client=None):
+    """Page through a Letterboxd poster grid and collect film slugs."""
     client = client or make_client()
     slugs = []
     seen = set()
     page = 1
 
-    logger.info("Fetching Letterboxd watchlist for '%s'", username)
+    logger.info("Fetching Letterboxd %s", label)
 
     while True:
-        url = f"https://letterboxd.com/{username}/watchlist/page/{page}/"
+        url = f"{base_url}/page/{page}/"
         try:
             resp = http_get(client, url, timeout=30)
         except requests.RequestException as e:
@@ -294,7 +351,7 @@ def fetch_watchlist_slugs(username, client=None):
 
         if resp.status_code == 404:
             if page == 1:
-                raise WatchlistFetchError(f"Letterboxd user '{username}' not found")
+                raise WatchlistFetchError(not_found_message)
             break
         if resp.status_code == 403:
             raise WatchlistFetchError(
@@ -323,7 +380,7 @@ def fetch_watchlist_slugs(username, client=None):
         page += 1
         time.sleep(0.5)  # Be polite
 
-    logger.info("Found %d films in watchlist for '%s'", len(slugs), username)
+    logger.info("Found %d films in %s", len(slugs), label)
     return slugs
 
 
@@ -373,9 +430,10 @@ def fetch_film_info(slug, client):
     return parse_film_page(resp.text)
 
 
-def fetch_letterboxd_watchlist(username, film_cache=None, client=None):
+def fetch_letterboxd_watchlist(username, film_cache=None, client=None, lists=()):
     """
-    Fetch a user's watchlist and resolve each film's TMDb ID.
+    Fetch a user's watchlist, plus any extra lists, and resolve each film's
+    TMDb ID.
 
     film_cache maps slug -> film info. Known slugs skip the film page fetch;
     newly resolved films are added to it. Raises WatchlistFetchError.
@@ -385,6 +443,10 @@ def fetch_letterboxd_watchlist(username, film_cache=None, client=None):
         film_cache = {}
     client = client or make_client()
     slugs = fetch_watchlist_slugs(username, client)
+    for list_ref in lists:
+        for slug in fetch_list_slugs(list_ref, client):
+            if slug not in slugs:
+                slugs.append(slug)
 
     movies = []
     fetched = 0
@@ -524,6 +586,54 @@ def get_seerr_watchlist(seerr_url, api_key, seerr_user_id):
     return existing
 
 
+def remove_from_seerr_watchlist(tmdb_id, title, seerr_url, api_key, seerr_user_id=None):
+    """Remove an item from a user's Seerr watchlist. A 404 means it's already gone."""
+    headers = {"X-Api-Key": api_key}
+    if seerr_user_id:
+        headers["X-Api-User"] = str(seerr_user_id)
+    try:
+        resp = requests.delete(f"{seerr_url}/api/v1/watchlist/{tmdb_id}", headers=headers, timeout=10)
+    except requests.RequestException as e:
+        logger.error("Request failed removing '%s' from watchlist: %s", title, e)
+        return False
+    if resp.ok or resp.status_code == 404:
+        logger.info("Removed from watchlist: %s (TMDb: %d)", title, tmdb_id)
+        return True
+    logger.error("Failed to remove '%s' from watchlist: %d %s", title, resp.status_code, resp.text[:200])
+    return False
+
+
+def request_media(tmdb_id, title, seerr_url, api_key, seerr_user_id=None, media_type="movie"):
+    """
+    Create a Seerr request as the given user. Seerr applies that user's
+    permissions, quotas and auto-approve settings.
+    Returns (ok, error message).
+    """
+    headers = {"X-Api-Key": api_key, "Content-Type": "application/json"}
+    if seerr_user_id:
+        headers["X-Api-User"] = str(seerr_user_id)
+    payload = {"mediaType": media_type, "mediaId": tmdb_id}
+    if media_type == "tv":
+        payload["seasons"] = "all"
+    try:
+        resp = requests.post(f"{seerr_url}/api/v1/request", json=payload, headers=headers, timeout=15)
+    except requests.RequestException as e:
+        logger.error("Request failed requesting '%s': %s", title, e)
+        return False, "Could not reach Seerr"
+    if resp.ok:
+        logger.info("Requested: %s (TMDb %s: %d)", title, media_type, tmdb_id)
+        return True, None
+    if resp.status_code == 409:
+        logger.debug("Already requested: %s", title)
+        return True, None
+    try:
+        message = resp.json().get("message") or resp.text[:200]
+    except ValueError:
+        message = resp.text[:200]
+    logger.error("Failed to request '%s': %d %s", title, resp.status_code, message)
+    return False, f"Seerr refused the request ({resp.status_code}): {message}"
+
+
 # ---------------------------------------------------------------------------
 # Sync logic
 # ---------------------------------------------------------------------------
@@ -531,12 +641,29 @@ def sync_key(lb_username, seerr_user_id):
     return f"{lb_username}:{seerr_user_id or 'default'}"
 
 
-def sync_watchlist(lb_username, seerr_user_id, seerr_url, api_key, dry_run=None):
+def sync_watchlist(
+    lb_username,
+    seerr_user_id,
+    seerr_url,
+    api_key,
+    dry_run=None,
+    lists=(),
+    auto_request=False,
+    remove_missing=False,
+):
     """
-    Sync one Letterboxd watchlist to one Seerr user's watchlist.
+    Sync one Letterboxd watchlist (plus any extra lists) to one Seerr
+    user's watchlist.
 
-    Returns {added, skipped, failed, total, failures}. Raises
-    WatchlistFetchError if the watchlist can't be fetched.
+    auto_request: also create a Seerr request for each title added to
+        Letterboxd after auto-request is turned on. The first sync with it
+        on only records what's already there. Failed requests are retried
+        on the next sync.
+    remove_missing: remove titles from the Seerr watchlist once they're no
+        longer on Letterboxd, but only titles Letterboxderr added itself.
+
+    Returns {added, skipped, failed, requested, removed, total, failures}.
+    Raises WatchlistFetchError if a watchlist or list can't be fetched.
     """
     if dry_run is None:
         dry_run = DRY_RUN
@@ -545,30 +672,41 @@ def sync_watchlist(lb_username, seerr_user_id, seerr_url, api_key, dry_run=None)
     key = sync_key(lb_username, seerr_user_id)
     film_cache = dict(snapshot["films"])
     synced = set(snapshot["synced"].get(key, []))
+    ours = set(snapshot["added"].get(key, []))
 
-    movies = fetch_letterboxd_watchlist(lb_username, film_cache)
+    movies = fetch_letterboxd_watchlist(lb_username, film_cache, lists=lists)
 
     # Also check the existing Seerr watchlist to avoid duplicates
     if seerr_user_id:
         synced.update(get_seerr_watchlist(seerr_url, api_key, seerr_user_id))
 
-    added = skipped = failed = 0
+    # The first auto-request run only records a baseline, so turning it on
+    # never requests a whole existing watchlist at once
+    baseline = key not in snapshot["requested"]
+    requested = set(snapshot["requested"].get(key, []))
+
+    added = skipped = failed = requested_count = removed = 0
     failures = []
     newly_synced = set()
+    newly_requested = set()
+    removed_keys = set()
+    current = {}  # media key -> (tmdb_id, media_type, display title)
 
     for movie in movies:
         tmdb_id = movie.get("tmdb_id")
         media_type = movie.get("media_type", "movie")
         title = movie.get("title")
+        display = title or slug_to_title(movie["slug"])
 
         # Fall back to Seerr search if the film page didn't give an ID
         if not tmdb_id:
-            query = title or slug_to_title(movie["slug"])
-            tmdb_id, found_type = resolve_tmdb_id_via_seerr(query, movie.get("year"), seerr_url, api_key)
+            tmdb_id, found_type = resolve_tmdb_id_via_seerr(display, movie.get("year"), seerr_url, api_key)
             if tmdb_id:
                 media_type = found_type
-
-        display = title or slug_to_title(movie["slug"])
+                # Cache it, so two-way sync always recognises this title again
+                film_cache[movie["slug"]] = {
+                    "tmdb_id": tmdb_id, "media_type": media_type, "title": display, "year": movie.get("year"),
+                }
 
         if not tmdb_id:
             logger.warning("Could not resolve TMDb ID for: %s", movie["letterboxd_url"])
@@ -577,42 +715,90 @@ def sync_watchlist(lb_username, seerr_user_id, seerr_url, api_key, dry_run=None)
             continue
 
         mkey = media_key(media_type, tmdb_id)
+        current[mkey] = (tmdb_id, media_type, display)
+
         if mkey in synced:
             skipped += 1
-            continue
-
-        if dry_run:
+        elif dry_run:
             logger.info("[DRY RUN] Would add to watchlist: %s (TMDb %s: %d)", display, media_type, tmdb_id)
             added += 1
-            continue
-
-        if add_to_seerr_watchlist(tmdb_id, display, seerr_url, api_key, seerr_user_id, media_type):
+        elif add_to_seerr_watchlist(tmdb_id, display, seerr_url, api_key, seerr_user_id, media_type):
             synced.add(mkey)
             newly_synced.add(mkey)
             added += 1
+            time.sleep(0.3)
         else:
             failed += 1
             failures.append({"title": display, "reason": "Seerr rejected the request"})
+            time.sleep(0.3)
+            continue
 
-        # Small delay between API calls
-        time.sleep(0.3)
+        if auto_request and baseline:
+            requested.add(mkey)
+        elif auto_request and mkey not in requested:
+            if dry_run:
+                logger.info("[DRY RUN] Would request: %s", display)
+                requested_count += 1
+                continue
+            ok, error = request_media(tmdb_id, display, seerr_url, api_key, seerr_user_id, media_type)
+            if ok:
+                requested.add(mkey)
+                newly_requested.add(mkey)
+                requested_count += 1
+            else:
+                failed += 1
+                failures.append({"title": display, "reason": error})
+            time.sleep(0.3)
+
+    if remove_missing:
+        gone = ours - set(current)
+        if gone and not movies:
+            # An empty result is far more likely a scraping problem than a
+            # deliberately emptied watchlist, so don't wipe everything.
+            logger.warning("No films found for '%s'; skipping removals to be safe", lb_username)
+        else:
+            for mkey in sorted(gone):
+                media_type, tmdb_id = mkey.split(":")
+                display = next(
+                    (f["title"] for f in film_cache.values()
+                     if f.get("tmdb_id") == int(tmdb_id) and f.get("media_type") == media_type),
+                    mkey,
+                )
+                if dry_run:
+                    logger.info("[DRY RUN] Would remove from watchlist: %s", display)
+                    removed += 1
+                elif remove_from_seerr_watchlist(int(tmdb_id), display, seerr_url, api_key, seerr_user_id):
+                    removed_keys.add(mkey)
+                    removed += 1
+                else:
+                    failed += 1
+                    failures.append({"title": display, "reason": "Seerr wouldn't remove it from the watchlist"})
 
     def commit(state):
         state["films"].update(film_cache)
-        if not dry_run:
-            merged = set(state["synced"].get(key, [])) | synced | newly_synced
-            state["synced"][key] = sorted(merged)
+        if dry_run:
+            return
+        merged = (set(state["synced"].get(key, [])) | synced | newly_synced) - removed_keys
+        state["synced"][key] = sorted(merged)
+        state["added"][key] = sorted((set(state["added"].get(key, [])) | newly_synced) - removed_keys)
+        if auto_request:
+            state["requested"][key] = sorted(set(state["requested"].get(key, [])) | requested | newly_requested)
+        else:
+            # Turning auto-request back on later re-baselines from that point
+            state["requested"].pop(key, None)
 
     update_state(commit)
 
     logger.info(
-        "Sync complete for '%s': %d added, %d skipped, %d failed%s",
-        lb_username, added, skipped, failed, " (dry run)" if dry_run else "",
+        "Sync complete for '%s': %d added, %d requested, %d removed, %d skipped, %d failed%s",
+        lb_username, added, requested_count, removed, skipped, failed, " (dry run)" if dry_run else "",
     )
     return {
         "added": added,
         "skipped": skipped,
         "failed": failed,
+        "requested": requested_count,
+        "removed": removed,
         "total": len(movies),
         "failures": failures,
         "dry_run": dry_run,
@@ -620,9 +806,13 @@ def sync_watchlist(lb_username, seerr_user_id, seerr_url, api_key, dry_run=None)
 
 
 def forget_user(lb_username, seerr_user_id):
-    """Drop a user's synced IDs from state, e.g. after they unlink."""
+    """Drop a user's sync records from state, e.g. after they unlink."""
     key = sync_key(lb_username, seerr_user_id)
-    update_state(lambda state: state["synced"].pop(key, None))
+
+    def forget(state):
+        for section in ("synced", "added", "requested"):
+            state[section].pop(key, None)
+    update_state(forget)
 
 
 def run_sync(config):
@@ -643,8 +833,20 @@ def run_sync(config):
             continue
         seerr_user_id = user_config.get("seerr_user_id")
         logger.info("Syncing %s -> Seerr user %s", lb_username, seerr_user_id or "default")
+        lists = []
+        for value in user_config.get("lists", []):
+            ref = parse_list_ref(value)
+            if ref:
+                lists.append(ref)
+            else:
+                logger.warning("Ignoring invalid Letterboxd list %r for %s", value, lb_username)
         try:
-            sync_watchlist(lb_username, seerr_user_id, seerr_url, api_key)
+            sync_watchlist(
+                lb_username, seerr_user_id, seerr_url, api_key,
+                lists=lists,
+                auto_request=bool(user_config.get("auto_request", False)),
+                remove_missing=bool(user_config.get("remove_missing", False)),
+            )
         except WatchlistFetchError as e:
             logger.error("Could not fetch watchlist for %s: %s", lb_username, e)
         except Exception as e:
